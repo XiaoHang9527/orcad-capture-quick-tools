@@ -1,0 +1,21 @@
+# Local backups created while updating the installed Capture script
+OrCADQuickTools.before-*.tcl
+OrCADQuickTools.before_*.tcl
+
+# Historical/local-only helpers
+OrCADPinNetToExcel.ps1
+VerifyNCPrefixLoad.tcl
+README.txt
+
+# Generated files and logs
+*.xlsx
+*.csv
+*.log
+*.tmp
+~$*
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

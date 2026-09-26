@@ -1,0 +1,3 @@
+*.tcl text eol=crlf
+*.md text eol=lf
+OrCADPinNetXlsx.tcl -text
