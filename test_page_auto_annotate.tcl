@@ -322,14 +322,44 @@ if {$::references(part2) ne "Q201" || $::occurrenceReferences(occ2) ne "Q201" ||
 puts "PASS: occurrence-visible reference and silent instance write"
 
 ::QuickToolsHelp::AddAccessoryMenus
-if {[llength $::accessoryMenus] != 9} {
-    error "Expected 9 Quick Tools menu items, got [llength $::accessoryMenus]"
+if {[llength $::accessoryMenus] != 12} {
+    error "Expected 11 shortcuts plus mouse navigation toggle, got [llength $::accessoryMenus]"
 }
-foreach lMenuItem $::accessoryMenus {
+if {[lindex [lindex $::accessoryMenus end] 2] ne "::QuickToolsHelp::Invoke ::OrCADQuickTools::ToggleWheelZoom"} {
+    error "Missing mouse navigation toggle menu callback"
+}
+if {[string first "\u9F20\u6807\u5BFC\u822A" [lindex [lindex $::accessoryMenus end] 1]] < 0} {
+    error "Mouse navigation menu label missing"
+}
+if {[string first "\u6309\u4F4F\u53F3\u952E\u62D6\u52A8" [::QuickToolsHelp::ShortcutText]] < 0} {
+    error "Right-drag pan help missing"
+}
+foreach lMenuItem [lrange $::accessoryMenus 0 10] {
     if {[lindex $lMenuItem 0] ne $::QuickToolsHelp::MenuName ||
         [string first "Alt+" [lindex $lMenuItem 1]] < 0} {
         error "Invalid Quick Tools menu item: $lMenuItem"
     }
+}
+set lExpectedHotkeys {Alt+F1 Alt+F2 Alt+F3 Alt+F5 Alt+F6 Alt+F7 Alt+F8 Alt+F9 Alt+F10 Alt+R Alt+S}
+set lMenuHotkeys {}
+foreach lMenuItem [lrange $::accessoryMenus 0 10] {
+    if {![regexp {(Alt\+[A-Z][0-9]*)$} [lindex $lMenuItem 1] lHotkey]} {
+        error "Missing shortcut at end of menu label: $lMenuItem"
+    }
+    lappend lMenuHotkeys $lHotkey
+}
+if {$lMenuHotkeys ne $lExpectedHotkeys} {
+    error "Quick Tools menu order: expected $lExpectedHotkeys, got $lMenuHotkeys"
+}
+set lHelpHotkeys {}
+foreach lLine [lrange [split [::QuickToolsHelp::ShortcutText] "\n"] 0 10] {
+    if {![regexp {^(Alt\+[A-Z][0-9]*)[ ]+} $lLine lMatch lHotkey]} {
+        error "Missing shortcut at start of help line: $lLine"
+    }
+    lappend lHelpHotkeys $lHotkey
+}
+if {$lHelpHotkeys ne $lExpectedHotkeys} {
+    error "Shortcut help order: expected $lExpectedHotkeys, got $lHelpHotkeys"
 }
 if {[string first "\u7ED9\u6240\u9009\u5668\u4EF6" [::QuickToolsHelp::ShortcutText]] < 0} {
     error "Shortcut help was not translated to Chinese"

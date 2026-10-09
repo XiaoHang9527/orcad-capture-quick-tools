@@ -19,3 +19,12 @@ README.txt
 .idea/
 .DS_Store
 Thumbs.db
+
+# Build locally from the included source; distribute binary with release files.
+OrCADWheelZoom.exe
+
+# Generated share packages; rebuild with package_release.ps1.
+dist/
+
+# Local article artwork is not part of the tool's source or install package.
+article_images/
