@@ -134,7 +134,7 @@ set ::contextResult {}; set ::calls {}; set ::notices {}
 update idletasks
 set callback [lindex [after info $::SignalsNavigation::Pending] 0]
 after cancel $::SignalsNavigation::Pending
-::SignalsNavigation::PollContext [lindex $callback 1] [lindex $callback 2] 90
+::SignalsNavigation::PollContext [lindex $callback 1] [lindex $callback 2] 110
 assert {$::calls eq {{context wireA}} && [llength $::notices]==1 && !$::SignalsNavigation::Busy && $::SignalsNavigation::Pending eq ""} "Timed out helper dispatched Signals or leaked busy state"
 set ::contextResult context-ready; set ::calls {}; set ::notices {}
 ::SignalsNavigation::Run
@@ -150,6 +150,16 @@ assert {$::statuses==$::deleted} "DboState leaked"
 set items [::QuickToolsHelp::ShortcutItems]
 assert {[lindex [lindex $items end] 0] eq "Alt+S" && [lindex [lindex $items end] 2] eq "::SignalsNavigation::Run"} "Registry/menu/help action missing"
 puts "PASS: helper errors/timeouts and old acknowledgement rejected; no fallback 14844; DB statuses released; no design writes"
+
+set ::contextResult signals-invoked-menu-open; set ::calls {}; set ::notices {}; set ::selection wireA
+::SignalsNavigation::Run
+update idletasks
+settle
+assert {$::calls eq {{context wireA}} && [llength $::notices]==1 && !$::SignalsNavigation::Busy && $::SignalsNavigation::Pending eq ""} "Residual menu acknowledgement retried Signals or leaked state"
+assert {[string first "Signals \u5DF2\u8C03\u7528" [lindex $::notices 0]] >= 0} "Residual menu falsely reported failed action"
+assert {[string first {no action retry} [join $::logs]] >= 0} "Residual menu cleanup diagnostic missing"
+set ::contextResult signals-invoked
+puts "PASS: Signals invoked with residual menu is acknowledged once; cleanup warning distinct from action failure"
 
 # Inspect the real launcher with a mocked exec: no child/UI actions. The ready
 # marker MUST be absent while exec runs and published only after its return.

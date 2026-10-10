@@ -9,7 +9,7 @@ $modules = @(
     @{ File = 'OrCADWheelZoom.tcl'; Title = '04 MOUSE NAVIGATION CONTROLLER' }
 )
 $bundle = [System.Text.StringBuilder]::new()
-[void]$bundle.AppendLine('# OrCAD Capture Quick Tools - merged two-file edition, 2026.10.09')
+[void]$bundle.AppendLine('# OrCAD Capture Quick Tools - merged two-file edition, 2026.10.10 / helper 0.20')
 [void]$bundle.AppendLine('# Runtime: OrCADQuickTools.tcl + OrCADWheelZoom.exe in the same directory.')
 [void]$bundle.AppendLine('# Tcl 8.4; ASCII source / Unicode-escaped UI; no external Tcl source calls.')
 [void]$bundle.AppendLine('#')

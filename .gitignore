@@ -1,6 +1,8 @@
 # Local backups created while updating the installed Capture script
 OrCADQuickTools.before-*.tcl
 OrCADQuickTools.before_*.tcl
+installation-backups/
+installation-staging/
 
 # Historical/local-only helpers
 OrCADPinNetToExcel.ps1

@@ -207,14 +207,15 @@ proc ::SignalsNavigation::PollContext {snapshot resultFile attempt} {
         }
         if {$f ne ""} {catch {close $f}}
     }
-    if {$result eq "" && $attempt < 90} {
+    # Release-keys/menu lookup plus bounded popup cleanup can take about 5 s.
+    if {$result eq "" && $attempt < 110} {
         set Pending [after 50 [list ::SignalsNavigation::PollContext $snapshot $resultFile [expr {$attempt+1}]]]
         return
     }
     set Busy 0
     catch {file delete $resultFile}
     catch {file delete "$resultFile.ready"}
-    if {$result ne "signals-invoked"} {
+    if {$result ne "signals-invoked" && $result ne "signals-invoked-menu-open"} {
         if {$result eq ""} {set result "Context helper timed out; update BOTH runtime files"}
         Log "Native Signals action not confirmed: $result"
         Notice "Signals \u83DC\u5355\u64CD\u4F5C\u672A\u786E\u8BA4\u5B8C\u6210\u3002\n\u8BF7\u5355\u51FB\u9009\u4E2D\u5BFC\u7EBF\uFF0C\u9F20\u6807\u505C\u7559\u5728\u8BE5\u5BFC\u7EBF\u4E0A\uFF0C\u518D\u6309 Alt+S\u3002\n\u66F4\u65B0\u65F6\u8BF7\u540C\u65F6\u66FF\u6362 TCL \u548C EXE\uFF0C\u7136\u540E\u91CD\u542F Capture\u3002\n$result"
@@ -224,6 +225,10 @@ proc ::SignalsNavigation::PollContext {snapshot resultFile attempt} {
         Log "Signals menu action returned, but selection/page/net changed; pane result not verified"
     } else {
         Log "Native Signals menu action returned; requested net=[lindex $snapshot 2] wireId=[lindex $snapshot 1]; pane result not verified"
+    }
+    if {$result eq "signals-invoked-menu-open"} {
+        Log "Signals invoked once, but its popup is still visible; no action retry"
+        Notice "Signals \u5DF2\u8C03\u7528\uFF0C\u4F46\u53F3\u952E\u83DC\u5355\u672A\u81EA\u52A8\u6536\u8D77\u3002\n\u8BF7\u6309 Esc \u5173\u95ED\u83DC\u5355\uFF0C\u65E0\u9700\u91CD\u590D\u6267\u884C Alt+S\u3002\n\u8BF7\u63D0\u4F9B OrCADSignalsNavigation-native.log \u4EE5\u4FBF\u5206\u6790\u3002"
     }
 }
 

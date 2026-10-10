@@ -1,4 +1,5 @@
-// Pure policy/ABI tests; does not create hooks or interact with Capture.
+// Default: pure policy/ABI tests, no hooks or Capture interaction.
+// Optional --signals-guard-smoke: read-only hook startup/teardown, no UI input.
 using System;
 using System.IO;
 using System.Reflection;
@@ -12,8 +13,26 @@ internal static class WheelNativeTests
     static string Reason(bool active=true, bool modifiers=false, uint flags=0, bool captured=false,
         bool own=true, bool current=true, string cls="OrRandomView", int id=0xE900, bool mdi=true, bool inside=true)
     { return OrCADWheelZoom.ScopeReason(active, modifiers, flags, captured, own, current, cls, id, mdi, inside); }
-    public static int Main()
+    public static int Main(string[] args)
     {
+        // Older .NET can fail formatting a stack trace under a Unicode path.
+        try { return Run(args); }
+        catch (Exception ex) { Console.Error.WriteLine("FAIL: " + ex.Message); return 1; }
+    }
+    static int Run(string[] args)
+    {
+        if (args.Length == 1 && args[0] == "--signals-guard-smoke") {
+            for (int request=0; request<3; request++) {
+                var observer = new OrCADWheelZoom.SignalsGestureObserver();
+                try { Equal(observer.Ready,true,"both temporary observer hooks installed"); }
+                finally { observer.Dispose(); }
+                Equal(observer.Ready,false,"observer no longer reports healthy after disposal");
+                Equal(observer.HasExited,true,"observer thread/message pump exited; no persistent listener");
+            }
+            Console.WriteLine("PASS: " + checks + " Signals read-only observer lifecycle checks (" + (IntPtr.Size*8)
+                + "-bit); no Capture commands or UI input.");
+            return 0;
+        }
         Equal(Reason(), "eligible", "hover current schematic");
         var mainRoot = new IntPtr(10); var ownedDrawingRoot = new IntPtr(11); var otherRoot = new IntPtr(12);
         Equal(OrCADWheelZoom.ForegroundAllowsDrawing(true,true,ownedDrawingRoot,ownedDrawingRoot,mainRoot,mainRoot,"AfxMDIFrame80"),true,"drawing frame foreground before switching");
@@ -47,6 +66,16 @@ internal static class WheelNativeTests
         Equal(Reason(flags:1), "eligible", "caret blink is not a menu");
         Equal(Reason(active:false), "controller-disabled-or-stale", "controller stale");
         Equal(Reason(modifiers:true), "modifier-or-button-held", "Ctrl/Shift/Alt/mouse buttons");
+        foreach (int key in new int[] {0x10,0x11,0x12,0x5B,0x5C}) {
+            Equal(OrCADWheelZoom.ScopeInputBlocks(key,false,false),true,"wheel still blocks keyboard modifiers");
+            Equal(OrCADWheelZoom.ScopeInputBlocks(key,true,false),true,"pan still blocks keyboard modifiers");
+            Equal(OrCADWheelZoom.ScopeInputBlocks(key,false,true),false,"Signals allows initial shortcut modifiers without release wait");
+        }
+        foreach (int key in new int[] {1,2,4,5,6}) {
+            Equal(OrCADWheelZoom.ScopeInputBlocks(key,false,true),true,"Signals still blocks held mouse buttons");
+            Equal(OrCADWheelZoom.ScopeInputBlocks(key,false,false),true,"wheel mouse-button guard unchanged");
+        }
+        Equal(OrCADWheelZoom.ScopeInputBlocks(2,true,false),false,"pan start still permits its own right-down");
         Equal(Reason(captured:true), "menu-dialog-or-drag", "drag");
         Equal(Reason(flags:4), "menu-dialog-or-drag", "menu");
         Equal(Reason(own:false), "hit-outside-capture", "Chrome must not fall back to focus");
@@ -309,6 +338,174 @@ internal static class WheelNativeTests
         Equal(OrCADWheelZoom.SignalsPopupScopeAllowed(true,false,false,true),false,"thread alone cannot authorize hidden popup");
         foreach (int role in new int[] {0,9,11,43})
             Equal(OrCADWheelZoom.SignalsAccessibleItemAllowed("Signals",role,0),false,"non-menu item cannot invoke");
+        Equal(OrCADWheelZoom.SignalsPopupStyleAllowed(0x80000000u),true,"plain popup style accepted");
+        Equal(OrCADWheelZoom.SignalsPopupStyleAllowed(0x80800000u),true,"bordered MFC popup accepted");
+        Equal(OrCADWheelZoom.SignalsPopupStyleAllowed(0x80C00000u),false,"captioned floating pane rejected");
+        Equal(OrCADWheelZoom.SignalsPopupStyleAllowed(0x80080000u),false,"system-menu dialog rejected");
+        Equal(OrCADWheelZoom.SignalsPopupStyleAllowed(0xC0000000u),false,"child window rejected");
+        Equal(OrCADWheelZoom.SignalsPopupStyleAllowed(0x00800000u),false,"non-popup window rejected");
+        foreach (string cls in new string[] {"#32768", "Afx:popup-menu", "AfxWnd140"})
+            Equal(OrCADWheelZoom.SignalsCleanupTargetAllowed(true,true,true,false,cls),true,"matched new standard/MFC popup may close");
+        foreach (string cls in new string[] {null, "", "#32770", "OrCaptureFrame", "OrRandomView", "SysTreeView32", "SysShadow"})
+            Equal(OrCADWheelZoom.SignalsCleanupTargetAllowed(true,true,true,false,cls),false,"unverified non-menu class never closes");
+        Equal(OrCADWheelZoom.SignalsCleanupTargetAllowed(false,true,true,false,"#32768"),false,"pre-existing popup untouched");
+        Equal(OrCADWheelZoom.SignalsCleanupTargetAllowed(true,false,true,false,"#32768"),false,"foreign popup untouched");
+        Equal(OrCADWheelZoom.SignalsCleanupTargetAllowed(true,true,false,false,"AfxWnd140"),false,"child/result control untouched");
+        Equal(OrCADWheelZoom.SignalsCleanupTargetAllowed(true,true,true,true,"AfxWnd140"),false,"main frame/drawing root untouched");
+        Equal(OrCADWheelZoom.SignalsCleanupEligibility(false,false,false,false,false),OrCADWheelZoom.SignalsCleanupProbe.Gone,"invisible/destroyed popup needs no messages");
+        Equal(OrCADWheelZoom.SignalsCleanupEligibility(true,true,true,true,true),OrCADWheelZoom.SignalsCleanupProbe.Safe,"unchanged exact popup may close");
+        Equal(OrCADWheelZoom.SignalsCleanupEligibility(true,false,true,true,true),OrCADWheelZoom.SignalsCleanupProbe.Unsafe,"changed handle/class/thread/owner rejected");
+        Equal(OrCADWheelZoom.SignalsCleanupEligibility(true,true,false,true,true),OrCADWheelZoom.SignalsCleanupProbe.Unsafe,"unproven target rejected");
+        Equal(OrCADWheelZoom.SignalsCleanupEligibility(true,true,true,false,true),OrCADWheelZoom.SignalsCleanupProbe.Unsafe,"foreground/page/modal change stops cleanup");
+        Equal(OrCADWheelZoom.SignalsCleanupEligibility(true,true,true,true,false),OrCADWheelZoom.SignalsCleanupProbe.Unsafe,"new mouse/key input stops cleanup");
+        foreach (uint tag in new uint[] {0u,123u,0x4F435251u})
+            Equal(OrCADWheelZoom.SignalsGestureMessage(false,0x0200,new UIntPtr(tag)),false,"hover never cancels cleanup");
+        foreach (int msg in new int[] {0x0201,0x0202,0x0203,0x0204,0x0205,0x0206,0x0207,0x0208,0x0209,0x020A,0x020B,0x020C,0x020D,0x020E})
+            Equal(OrCADWheelZoom.SignalsGestureMessage(false,msg,UIntPtr.Zero),true,"click/double-click/wheel/extra button cancels cleanup");
+        foreach (int msg in new int[] {0x0204,0x0205}) {
+            Equal(OrCADWheelZoom.SignalsGestureMessage(false,msg,OrCADWheelZoom.RightClickTag),false,"own popup replay is not user cancellation");
+            Equal(OrCADWheelZoom.SignalsGestureMessage(false,msg,new UIntPtr(123u)),true,"driver/remote right-click remains cancellation");
+        }
+        Equal(OrCADWheelZoom.SignalsGestureMessage(false,0x0201,OrCADWheelZoom.RightClickTag),true,"tag does not exempt unrelated left-click");
+        foreach (int msg in new int[] {0x0100,0x0101,0x0104,0x0105})
+            Equal(OrCADWheelZoom.SignalsGestureMessage(true,msg,UIntPtr.Zero),true,"keyboard edges are candidates; state distinguishes shortcut release");
+        Equal(OrCADWheelZoom.SignalsGestureMessage(true,0x0200,UIntPtr.Zero),false,"unrelated keyboard callback message ignored");
+        var gesture = new OrCADWheelZoom.SignalsGestureState();
+        int checkpoint = gesture.Generation;
+        for (int i=0; i<100; i++) gesture.Observe(false,0x0200,UIntPtr.Zero);
+        Equal(gesture.Unchanged(checkpoint),true,"continuous menu hover preserves checkpoint");
+        gesture.Observe(false,0x0204,OrCADWheelZoom.RightClickTag);
+        gesture.Observe(false,0x0205,OrCADWheelZoom.RightClickTag);
+        Equal(gesture.Unchanged(checkpoint),true,"tagged popup opening preserves checkpoint");
+        gesture.Observe(false,0x0201,UIntPtr.Zero);
+        gesture.Observe(false,0x0202,UIntPtr.Zero);
+        Equal(gesture.Unchanged(checkpoint),false,"fast click remains latched after button released");
+        Equal(gesture.Generation,checkpoint+2,"each button edge counted");
+        checkpoint = gesture.Generation;
+        gesture.Observe(true,0x0100,UIntPtr.Zero);
+        gesture.Observe(true,0x0101,UIntPtr.Zero);
+        Equal(gesture.Unchanged(checkpoint),false,"fast key remains latched after release");
+        foreach (int[] held in new int[][] {new int[] {0x12,0x53},new int[] {0x11,0x71},new int[] {0xA2,0x71},
+            new int[] {0x10,0x11,0x71},new int[] {0xA0,0xA2,0x71},new int[] {0x12,0x77}}) {
+            gesture = new OrCADWheelZoom.SignalsGestureState();
+            gesture.SeedHeldKeys(delegate(int key) { return Array.IndexOf(held,key) >= 0; });
+            checkpoint = gesture.Generation;
+            foreach (int key in held) gesture.ObserveKeyboard(0x0100,key);
+            Equal(gesture.Unchanged(checkpoint),true,"original shortcut autorepeat is tolerated");
+            foreach (int key in held) gesture.ObserveKeyboard(0x0101,key);
+            Equal(gesture.Unchanged(checkpoint),true,"original shortcut release is tolerated");
+            gesture.ObserveKeyboard(0x0100,held[held.Length-1]);
+            Equal(gesture.Unchanged(checkpoint),false,"same shortcut key pressed again is a new operation");
+        }
+        gesture = new OrCADWheelZoom.SignalsGestureState();
+        gesture.SeedHeldKeys(delegate(int key) { return key==0x12; });
+        gesture.ObserveKeyboard(0x0104,0x12); gesture.ObserveKeyboard(0x0105,0x12);
+        Equal(gesture.Generation,0,"initial Alt system-key repeat/up is ignored");
+        gesture.ObserveKeyboard(0x0104,0x12);
+        Equal(gesture.Generation,1,"new Alt system-key down is not ignored");
+        gesture = new OrCADWheelZoom.SignalsGestureState();
+        gesture.SeedHeldKeys(delegate(int key) { return key==0x11 || key==0x71; });
+        gesture.ObserveKeyboard(0x0100,0x41); gesture.ObserveKeyboard(0x0101,0x41);
+        Equal(gesture.Generation,2,"different key while initial Ctrl held remains cancellation");
+        gesture.ObserveKeyboard(0x0100,0x1B);
+        Equal(gesture.Generation,3,"new Escape still cancels");
+        gesture = new OrCADWheelZoom.SignalsGestureState();
+        gesture.SeedHeldKeys(delegate(int key) { return key==0x1B; });
+        gesture.ObserveKeyboard(0x0101,0x1B);
+        Equal(gesture.Generation,1,"Escape during observer setup cannot be excused as an initial shortcut");
+        var cleanupMessages = new System.Collections.Generic.List<uint>();
+        int cleanupDelay = 0;
+        var cleanupResult = OrCADWheelZoom.FinishSignalsPopup(
+            delegate { return OrCADWheelZoom.SignalsCleanupProbe.Gone; },
+            delegate(uint msg) {cleanupMessages.Add(msg);}, delegate(int ms) {cleanupDelay += ms;});
+        Equal(cleanupResult,OrCADWheelZoom.SignalsCleanupResult.Closed,"16.6 already-closed path");
+        Equal(cleanupMessages.Count,0,"16.6 adds no cancel/Escape messages");
+        Equal(cleanupDelay,0,"16.6 already-closed path adds no delay");
+        cleanupDelay = 0;
+        cleanupResult = OrCADWheelZoom.FinishSignalsPopup(
+            delegate {return cleanupDelay >= 20 ? OrCADWheelZoom.SignalsCleanupProbe.Gone : OrCADWheelZoom.SignalsCleanupProbe.Safe;},
+            delegate(uint msg) {cleanupMessages.Add(msg);}, delegate(int ms) {cleanupDelay += ms;});
+        Equal(cleanupResult,OrCADWheelZoom.SignalsCleanupResult.Closed,"asynchronous dismissal confirmed without retry");
+        Equal(cleanupMessages.Count,1,"still-open popup receives immediate cancel rather than grace wait");
+        Equal(cleanupDelay,20,"native asynchronous close still observed");
+        cleanupMessages.Clear(); cleanupDelay=0;
+        bool popupVisible = true;
+        cleanupResult = OrCADWheelZoom.FinishSignalsPopup(
+            delegate {return popupVisible ? OrCADWheelZoom.SignalsCleanupProbe.Safe : OrCADWheelZoom.SignalsCleanupProbe.Gone;},
+            delegate(uint msg) {Equal(cleanupDelay,0,"no grace before cancel"); cleanupMessages.Add(msg); popupVisible=false;}, delegate(int ms) {});
+        Equal(cleanupResult,OrCADWheelZoom.SignalsCleanupResult.Closed,"residual popup closes after cancel");
+        Equal(cleanupMessages.Count,1,"cancel sent only once");
+        Equal(cleanupMessages[0],OrCADWheelZoom.SignalsCancelMessage,"cancel before Escape");
+        cleanupMessages.Clear(); popupVisible=true;
+        cleanupResult = OrCADWheelZoom.FinishSignalsPopup(
+            delegate {return popupVisible ? OrCADWheelZoom.SignalsCleanupProbe.Safe : OrCADWheelZoom.SignalsCleanupProbe.Gone;},
+            delegate(uint msg) {cleanupMessages.Add(msg); if(msg==OrCADWheelZoom.SignalsEscapeMessage) popupVisible=false;}, delegate(int ms) {});
+        Equal(cleanupResult,OrCADWheelZoom.SignalsCleanupResult.Closed,"custom menu Escape fallback closes");
+        Equal(cleanupMessages.Count,2,"custom menu gets two bounded messages");
+        Equal(cleanupMessages[1],OrCADWheelZoom.SignalsEscapeMessage,"directed popup Escape fallback");
+        cleanupMessages.Clear(); cleanupDelay=0;
+        cleanupResult = OrCADWheelZoom.FinishSignalsPopup(
+            delegate {return OrCADWheelZoom.SignalsCleanupProbe.Safe;},
+            delegate(uint msg) {cleanupMessages.Add(msg);}, delegate(int ms) {cleanupDelay+=ms;});
+        Equal(cleanupResult,OrCADWheelZoom.SignalsCleanupResult.StillOpen,"unresponsive popup is not falsely confirmed closed");
+        Equal(cleanupMessages.Count,2,"stubborn popup is not spammed/reinvoked");
+        Equal(cleanupDelay,60,"cleanup wait shortened from 100ms to 60ms");
+        cleanupMessages.Clear(); cleanupDelay=0; popupVisible=true;
+        gesture = new OrCADWheelZoom.SignalsGestureState(); checkpoint=gesture.Generation;
+        cleanupResult = OrCADWheelZoom.FinishSignalsPopup(
+            delegate {return !popupVisible ? OrCADWheelZoom.SignalsCleanupProbe.Gone : gesture.Unchanged(checkpoint)
+                ? OrCADWheelZoom.SignalsCleanupProbe.Safe : OrCADWheelZoom.SignalsCleanupProbe.Unsafe;},
+            delegate(uint msg) {cleanupMessages.Add(msg); if(msg==OrCADWheelZoom.SignalsEscapeMessage) popupVisible=false;},
+            delegate(int ms) {cleanupDelay+=ms; gesture.Observe(false,0x0200,UIntPtr.Zero);});
+        Equal(cleanupResult,OrCADWheelZoom.SignalsCleanupResult.Closed,"hover throughout cleanup still dismisses MFC menu");
+        Equal(cleanupDelay,40,"Escape fallback observed after 30+10ms, no grace");
+        Equal(cleanupMessages.Count,2,"hover neither duplicates Signals nor prevents fallback");
+        cleanupMessages.Clear(); cleanupDelay=0;
+        gesture = new OrCADWheelZoom.SignalsGestureState(); checkpoint=gesture.Generation;
+        cleanupResult = OrCADWheelZoom.FinishSignalsPopup(
+            delegate {return gesture.Unchanged(checkpoint) ? OrCADWheelZoom.SignalsCleanupProbe.Safe : OrCADWheelZoom.SignalsCleanupProbe.Unsafe;},
+            delegate(uint msg) {cleanupMessages.Add(msg);}, delegate(int ms) {
+                cleanupDelay+=ms; gesture.Observe(false,0x0201,UIntPtr.Zero); gesture.Observe(false,0x0202,UIntPtr.Zero);
+            });
+        Equal(cleanupResult,OrCADWheelZoom.SignalsCleanupResult.Skipped,"completed fast click after cancel protects user's gesture");
+        Equal(cleanupMessages.Count,1,"completed fast click prevents additional Escape");
+        cleanupMessages.Clear(); cleanupDelay=0;
+        cleanupResult = OrCADWheelZoom.FinishSignalsPopup(
+            delegate {return cleanupDelay==0 ? OrCADWheelZoom.SignalsCleanupProbe.Safe : OrCADWheelZoom.SignalsCleanupProbe.Unsafe;},
+            delegate(uint msg) {cleanupMessages.Add(msg);}, delegate(int ms) {cleanupDelay+=ms;});
+        Equal(cleanupResult,OrCADWheelZoom.SignalsCleanupResult.Skipped,"new interaction after cancel stops cleanup");
+        Equal(cleanupMessages.Count,1,"new interaction receives no additional Escape");
+        cleanupMessages.Clear(); cleanupDelay=0;
+        cleanupResult = OrCADWheelZoom.FinishSignalsPopup(
+            delegate {return cleanupMessages.Count==0 ? OrCADWheelZoom.SignalsCleanupProbe.Safe : OrCADWheelZoom.SignalsCleanupProbe.Unsafe;},
+            delegate(uint msg) {cleanupMessages.Add(msg);}, delegate(int ms) {cleanupDelay+=ms;});
+        Equal(cleanupResult,OrCADWheelZoom.SignalsCleanupResult.Skipped,"context change after cancel prevents fallback");
+        Equal(cleanupMessages.Count,1,"context change never sends Escape later");
+        cleanupMessages.Clear();
+        cleanupResult = OrCADWheelZoom.FinishSignalsPopup(
+            delegate {return OrCADWheelZoom.SignalsCleanupProbe.Unsafe;},
+            delegate(uint msg) {cleanupMessages.Add(msg);}, delegate(int ms) {});
+        Equal(cleanupResult,OrCADWheelZoom.SignalsCleanupResult.Skipped,"unsafe target skipped immediately");
+        Equal(cleanupMessages.Count,0,"unsafe popup never receives input");
+        cleanupDelay=0; int cleanupProbes=0;
+        cleanupResult = OrCADWheelZoom.FinishSignalsPopup(
+            delegate {return ++cleanupProbes==1 ? OrCADWheelZoom.SignalsCleanupProbe.Safe : OrCADWheelZoom.SignalsCleanupProbe.Unsafe;},
+            delegate(uint msg) {cleanupMessages.Add(msg);}, delegate(int ms) {cleanupDelay+=ms;});
+        Equal(cleanupMessages.Count,0,"new input between initial probe and immediate cancel still prevents dismissal");
+        Equal(cleanupResult,OrCADWheelZoom.SignalsCleanupResult.Skipped,"zero grace does not bypass final recheck");
+        cleanupMessages.Clear(); cleanupDelay=0; popupVisible=true;
+        gesture = new OrCADWheelZoom.SignalsGestureState();
+        gesture.SeedHeldKeys(delegate(int key) {return key==0x11 || key==0x71;}); checkpoint=gesture.Generation;
+        bool shortcutReleased=false;
+        cleanupResult = OrCADWheelZoom.FinishSignalsPopup(
+            delegate {return !popupVisible ? OrCADWheelZoom.SignalsCleanupProbe.Gone : gesture.Unchanged(checkpoint)
+                ? OrCADWheelZoom.SignalsCleanupProbe.Safe : OrCADWheelZoom.SignalsCleanupProbe.Unsafe;},
+            delegate(uint msg) {cleanupMessages.Add(msg); if(msg==OrCADWheelZoom.SignalsEscapeMessage) popupVisible=false;},
+            delegate(int ms) {cleanupDelay+=ms;
+                if (!shortcutReleased) {gesture.ObserveKeyboard(0x0101,0x11); gesture.ObserveKeyboard(0x0101,0x71); shortcutReleased=true;}
+                gesture.Observe(false,0x0200,UIntPtr.Zero);});
+        Equal(cleanupResult,OrCADWheelZoom.SignalsCleanupResult.Closed,"releasing Ctrl+F2 during hover does not cancel menu dismissal");
+        Equal(cleanupMessages.Count,2,"Ctrl+F2 release permits only bounded popup messages");
         string resultTest = Path.Combine(Path.GetTempPath(), "OrCADSignalsAck-" + Guid.NewGuid().ToString("N") + ".result");
         try {
             OrCADWheelZoom.WriteSignalsResult(resultTest,"signals-invoked");

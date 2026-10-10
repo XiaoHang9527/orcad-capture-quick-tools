@@ -1,6 +1,6 @@
 # Build a shareable snapshot without old backups, private designs or logs.
 [CmdletBinding()]
-param([string]$ReleaseLabel = '2026.10.09-two-files', [switch]$RebuildMouseHelper)
+param([string]$ReleaseLabel = '2026.10.10-v0.20', [switch]$RebuildMouseHelper)
 $ErrorActionPreference = 'Stop'
 $quickReferenceName = -join (@(0x5FEB,0x6377,0x64CD,0x4F5C,0x901F,0x67E5) | ForEach-Object { [char]$_ })
 $quickReferenceName += '.md' # ASCII script stays readable by Windows PowerShell 5.1.

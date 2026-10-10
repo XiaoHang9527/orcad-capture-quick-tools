@@ -25,7 +25,7 @@ internal static class OrCADWheelZoom
     static Process capture;
     static EventWaitHandle stop;
     static int wheelCount;
-    const string Version = "wheel-0.17-signals-launch-handshake";
+    const string Version = "wheel-0.20-signals-key-independent";
     static readonly PanGesture pan = new PanGesture();
     static IntPtr panView;
     static IntPtr panForeground;
@@ -199,6 +199,8 @@ internal static class OrCADWheelZoom
     [DllImport("user32.dll", EntryPoint="GetWindowLongW")] static extern int GetWindowLong(IntPtr hwnd, int index);
     [DllImport("user32.dll")] static extern bool ScreenToClient(IntPtr hwnd, ref POINT pt);
     [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll", SetLastError=true)] static extern bool PostThreadMessage(uint thread, uint msg, IntPtr w, IntPtr l);
     [DllImport("user32.dll", SetLastError=true)] static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr w, IntPtr l);
     [DllImport("user32.dll", SetLastError=true)] static extern uint SendInput(uint count, NativeInput[] inputs, int size);
     [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", SetLastError=true)]
@@ -381,7 +383,15 @@ internal static class OrCADWheelZoom
 
     // Hover mode: controller heartbeat + exact drawing class + active MDI page.
     // No titles, net names, page numbers or screen coordinates are hard-coded.
-    static bool Eligible(POINT pt, out IntPtr view, out POINT messagePoint, bool rightDown = false)
+    internal static bool ScopeInputBlocks(int key, bool rightDown, bool signalsRequest)
+    {
+        if (rightDown && key == 2) return false;
+        // Signals has its own gesture guard. A user-configurable shortcut may
+        // still hold Ctrl/Shift/Alt/Win here; never loosen wheel/pan protection.
+        return !signalsRequest || key == 1 || key == 2 || key == 4 || key == 5 || key == 6;
+    }
+
+    static bool Eligible(POINT pt, out IntPtr view, out POINT messagePoint, bool rightDown = false, bool signalsRequest = false)
     {
         view = IntPtr.Zero;
         messagePoint = pt;
@@ -407,7 +417,7 @@ internal static class OrCADWheelZoom
         if (!GetGUIThreadInfo(thread, ref gui)) { Record("gui-query-failed", ""); return false; }
         bool modified = false;
         foreach (int key in modifierKeys) {
-            if (rightDown && key == 2) continue;
+            if (!ScopeInputBlocks(key, rightDown, signalsRequest)) continue;
             if (GetAsyncKeyState(key) < 0) { modified = true; break; }
         }
         bool mdi = false;
@@ -856,7 +866,7 @@ internal static class OrCADWheelZoom
         hookRearms++; Log("Input hook rearmed after cursor motion without callbacks; rearm=" + hookRearms);
     }
 
-    // Separate one-shot process, no hook or wheel preference changes. Capture's
+    // Separate one-shot process, no wheel preference changes. Capture's
     // custom MFC popup need not be #32768 / HMENU or set GUI_INMENUMODE.
     // Execute the enabled Signals MENUITEM in the newly opened Capture-owned
     // popup through MSAA. Never guess coordinates, send mnemonics, or blindly
@@ -890,6 +900,254 @@ internal static class OrCADWheelZoom
         internal IAccessible Parent;
         internal object Child;
         internal IntPtr Window;
+    }
+
+    internal enum SignalsCleanupProbe { Gone, Safe, Unsafe }
+    internal enum SignalsCleanupResult { Closed, Skipped, StillOpen }
+    // https://learn.microsoft.com/en-us/windows/win32/winmsg/wm-cancelmode
+    internal const uint SignalsCancelMessage = 0x001F; // WM_CANCELMODE
+    internal const uint SignalsEscapeMessage = 0x0100; // WM_KEYDOWN, only to captured popup
+
+    internal static bool SignalsGestureMessage(bool keyboard, int message, UIntPtr extra)
+    {
+        if (keyboard) return message == 0x0100 || message == 0x0101 || message == 0x0104 || message == 0x0105;
+        // Hover is not a new gesture. Ignore only our tagged native right-click
+        // pair; injected clicks from drivers/accessibility still count.
+        if (IsOwnRightClick(message, extra)) return false;
+        return message >= 0x0201 && message <= 0x020E;
+    }
+
+    internal sealed class SignalsGestureState
+    {
+        int generation;
+        readonly bool[] initialKeys = new bool[256];
+        internal int Generation { get { return Interlocked.CompareExchange(ref generation, 0, 0); } }
+        // Called on the observer thread after installing hooks, before pumping
+        // their callbacks. Transient held-state only; no key content or history.
+        internal void SeedHeldKeys(Func<int, bool> down)
+        { for (int key=8; key<initialKeys.Length; key++) initialKeys[key] = key != 0x1B && down(key); }
+        internal void ObserveKeyboard(int message, int key)
+        {
+            if (!SignalsGestureMessage(true, message, UIntPtr.Zero)) return;
+            bool up = message == 0x0101 || message == 0x0105;
+            if (key >= 8 && key < initialKeys.Length && initialKeys[key]) {
+                // Original shortcut autorepeat/release is not a new action.
+                // Once released, pressing it again DOES cancel the request.
+                if (up) initialKeys[key] = false;
+                return;
+            }
+            Interlocked.Increment(ref generation);
+        }
+        internal void Observe(bool keyboard, int message, UIntPtr extra)
+        { if (SignalsGestureMessage(keyboard, message, extra)) Interlocked.Increment(ref generation); }
+        internal bool Unchanged(int checkpoint) { return Generation == checkpoint; }
+    }
+
+    // Short-lived, read-only observer for this single Alt+S request. A dedicated
+    // message-pump thread keeps callbacks responsive while cross-process MSAA
+    // runs. Never swallow/replay input, record key values, or log mouse motion.
+    // https://learn.microsoft.com/en-us/windows/win32/winmsg/lowlevelmouseproc
+    internal sealed class SignalsGestureObserver : IDisposable
+    {
+        internal readonly SignalsGestureState State = new SignalsGestureState();
+        readonly ManualResetEvent ready = new ManualResetEvent(false);
+        readonly Thread worker;
+        readonly HookProc mouseCallback, keyboardCallback;
+        IntPtr mouseHook, keyboardHook;
+        uint threadId;
+        volatile bool stopped, listening;
+        internal bool Ready { get { return listening && !stopped; } }
+        internal bool HasExited { get { return !worker.IsAlive; } }
+
+        internal SignalsGestureObserver()
+        {
+            mouseCallback = delegate(int code, IntPtr message, IntPtr data) {
+                if (code >= 0 && message.ToInt32() != WM_MOUSEMOVE) {
+                    MouseData input = (MouseData)Marshal.PtrToStructure(data, typeof(MouseData));
+                    State.Observe(false, message.ToInt32(), input.Extra);
+                }
+                return CallNextHookEx(mouseHook, code, message, data);
+            };
+            keyboardCallback = delegate(int code, IntPtr message, IntPtr data) {
+                // KBDLLHOOKSTRUCT begins with DWORD vkCode. Do not retain/log it.
+                if (code >= 0) State.ObserveKeyboard(message.ToInt32(), Marshal.ReadInt32(data));
+                return CallNextHookEx(keyboardHook, code, message, data);
+            };
+            worker = new Thread(Run);
+            worker.IsBackground = true;
+            worker.Name = "Signals gesture guard";
+            worker.Start();
+            // Done BEFORE opening the popup, so setup does not extend its flash.
+            if (!ready.WaitOne(200)) stopped = true;
+        }
+
+        void Run()
+        {
+            try {
+                threadId = GetCurrentThreadId();
+                using (var context = new ApplicationContext())
+                using (var lifetime = new System.Windows.Forms.Timer()) {
+                    mouseHook = SetWindowsHookEx(WH_MOUSE_LL, mouseCallback, GetModuleHandle(null), 0);
+                    keyboardHook = SetWindowsHookEx(13, keyboardCallback, GetModuleHandle(null), 0);
+                    if (mouseHook == IntPtr.Zero || keyboardHook == IntPtr.Zero) return;
+                    State.SeedHeldKeys(delegate(int key) { return GetAsyncKeyState(key) < 0; });
+                    // Timer creates the message queue before publishing readiness.
+                    // Self-expire even if an accessibility call hangs in Capture.
+                    lifetime.Interval = 10000;
+                    lifetime.Tick += delegate { context.ExitThread(); };
+                    lifetime.Start();
+                    listening = true;
+                    ready.Set();
+                    if (!stopped) Application.Run(context);
+                }
+            } catch { /* Missing observer means cleanup is skipped, not retried. */ }
+            finally {
+                listening = false;
+                if (mouseHook != IntPtr.Zero) UnhookWindowsHookEx(mouseHook);
+                if (keyboardHook != IntPtr.Zero) UnhookWindowsHookEx(keyboardHook);
+                ready.Set();
+            }
+        }
+
+        public void Dispose()
+        {
+            stopped = true;
+            if (threadId != 0) PostThreadMessage(threadId, 0x0012, IntPtr.Zero, IntPtr.Zero); // WM_QUIT
+            if (worker.Join(200)) ready.Close();
+        }
+    }
+
+    internal static bool SignalsPopupStyleAllowed(uint style)
+    {
+        // Standard/MFC menus may have WS_BORDER, but are not captioned/system
+        // menu windows or child controls. Reject floating panes and dialogs.
+        return (style & 0x80000000u) != 0 && (style & 0x40000000u) == 0
+            && (style & 0x00080000u) == 0 && (style & 0x00C00000u) != 0x00C00000u;
+    }
+
+    internal static bool SignalsCleanupTargetAllowed(bool newlyCreated, bool inCaptureScope,
+        bool popupStyle, bool applicationWindow, string className)
+    {
+        // A previously identified Signals MENUITEM is also required by the caller.
+        // Never dismiss the drawing, main frame, a dialog or a floating result pane.
+        return newlyCreated && inCaptureScope && popupStyle && !applicationWindow
+            && (className == "#32768" || (className != null && className.StartsWith("Afx", StringComparison.Ordinal)));
+    }
+
+    internal static SignalsCleanupProbe SignalsCleanupEligibility(bool visible, bool sameIdentity,
+        bool allowedTarget, bool sameContext, bool sameInput)
+    {
+        if (!visible) return SignalsCleanupProbe.Gone;
+        return sameIdentity && allowedTarget && sameContext && sameInput
+            ? SignalsCleanupProbe.Safe : SignalsCleanupProbe.Unsafe;
+    }
+
+    internal static SignalsCleanupResult FinishSignalsPopup(Func<SignalsCleanupProbe> probe,
+        Action<uint> dismiss, Action<int> pause)
+    {
+        SignalsCleanupProbe state = probe();
+        if (state == SignalsCleanupProbe.Gone) return SignalsCleanupResult.Closed;
+        if (state == SignalsCleanupProbe.Unsafe) return SignalsCleanupResult.Skipped;
+        // No grace delay: already-closed menus get no messages; an exact still-
+        // visible popup is cancelled as soon as Signals returns.
+        foreach (uint message in new uint[] {SignalsCancelMessage, SignalsEscapeMessage}) {
+            state = probe();
+            if (state == SignalsCleanupProbe.Gone) return SignalsCleanupResult.Closed;
+            if (state == SignalsCleanupProbe.Unsafe) return SignalsCleanupResult.Skipped;
+            dismiss(message);
+            for (int attempt=0; attempt<3; attempt++) {
+                pause(10);
+                state = probe();
+                if (state == SignalsCleanupProbe.Gone) return SignalsCleanupResult.Closed;
+                if (state == SignalsCleanupProbe.Unsafe) return SignalsCleanupResult.Skipped;
+            }
+        }
+        return SignalsCleanupResult.StillOpen;
+    }
+
+    sealed class SignalsPopupTicket
+    {
+        internal IntPtr Window, MatchedWindow, OwnerRoot;
+        internal string ClassName;
+        internal uint Thread;
+        internal int GestureCheckpoint;
+        internal bool Allowed;
+        internal SignalsGestureObserver Input;
+    }
+
+    static SignalsPopupTicket CaptureSignalsPopup(SignalsAccessibleItem item,
+        HashSet<IntPtr> baseline, IntPtr foreground, IntPtr view, SignalsGestureObserver input)
+    {
+        // Resolve an accessible child to its popup root BEFORE invoking Signals.
+        var ticket = new SignalsPopupTicket();
+        ticket.MatchedWindow = item.Window;
+        ticket.Window = GetAncestor(item.Window, 2); // GA_ROOT, not ROOTOWNER
+        ticket.ClassName = ClassOf(ticket.Window);
+        ticket.OwnerRoot = GetAncestor(ticket.Window, 3);
+        uint pid;
+        ticket.Thread = GetWindowThreadProcessId(ticket.Window, out pid);
+        ticket.Allowed = SignalsCleanupTargetAllowed(!baseline.Contains(ticket.Window),
+            pid == capturePid && SignalsPopupInScope(ticket.Window, foreground, view),
+            SignalsPopupStyleAllowed(unchecked((uint)GetWindowLong(ticket.Window, -16))),
+            ticket.Window == foreground || ticket.Window == view || ticket.Window == GetAncestor(foreground, 2)
+                || ticket.Window == GetAncestor(view, 2), ticket.ClassName);
+        ticket.Input = input;
+        ticket.GestureCheckpoint = input.State.Generation;
+        Log("Signals cleanup ticket: window=" + ticket.Window.ToInt64().ToString("X")
+            + " class=" + ticket.ClassName + " allowed=" + ticket.Allowed + " observerReady=" + input.Ready);
+        return ticket;
+    }
+
+    static SignalsCleanupProbe ProbeSignalsPopup(SignalsPopupTicket ticket, IntPtr foreground, IntPtr view)
+    {
+        if (ticket.Window == IntPtr.Zero) {
+            return !IsWindow(ticket.MatchedWindow) || !IsWindowVisible(ticket.MatchedWindow)
+                ? SignalsCleanupProbe.Gone : SignalsCleanupProbe.Unsafe;
+        }
+        bool visible = IsWindow(ticket.Window) && IsWindowVisible(ticket.Window);
+        if (!visible) return SignalsCleanupProbe.Gone;
+        uint pid;
+        bool identity = GetWindowThreadProcessId(ticket.Window, out pid) == ticket.Thread
+            && pid == capturePid && ClassOf(ticket.Window) == ticket.ClassName
+            && GetAncestor(ticket.Window, 3) == ticket.OwnerRoot
+            && SignalsPopupStyleAllowed(unchecked((uint)GetWindowLong(ticket.Window, -16)));
+        bool unchangedInput = ticket.Input.Ready && ticket.Input.State.Unchanged(ticket.GestureCheckpoint);
+        foreach (int key in modifierKeys)
+            if (ScopeInputBlocks(key, false, true) && GetAsyncKeyState(key) < 0) unchangedInput = false;
+        if (GetAsyncKeyState(0x1B) < 0) unchangedInput = false;
+        bool context = GetForegroundWindow() == foreground && IsWindow(view) && IsWindowEnabled(view)
+            && SignalsPopupInScope(ticket.Window, foreground, view) && DrawingBelongsToForeground(foreground, view);
+        SignalsCleanupProbe result = SignalsCleanupEligibility(visible, identity, ticket.Allowed, context, unchangedInput);
+        if (result == SignalsCleanupProbe.Unsafe) Log("Signals cleanup guard: identity=" + identity
+            + " allowed=" + ticket.Allowed + " context=" + context + " gestureUnchanged=" + unchangedInput
+            + " foreground=" + GetForegroundWindow().ToInt64().ToString("X")
+            + " expectedForeground=" + foreground.ToInt64().ToString("X"));
+        return result;
+    }
+
+    static SignalsCleanupResult CompleteSignalsPopup(SignalsPopupTicket ticket, IntPtr foreground, IntPtr view)
+    {
+        try {
+            SignalsCleanupResult result = FinishSignalsPopup(
+                delegate { return ProbeSignalsPopup(ticket, foreground, view); },
+                delegate(uint message) {
+                    // Revalidate immediately before posting; never send Escape
+                    // to Capture's frame/drawing or use global keyboard input.
+                    if (ProbeSignalsPopup(ticket, foreground, view) != SignalsCleanupProbe.Safe) return;
+                    IntPtr key = message == SignalsEscapeMessage ? new IntPtr(0x1B) : IntPtr.Zero;
+                    IntPtr data = message == SignalsEscapeMessage ? new IntPtr(0x00010001) : IntPtr.Zero;
+                    bool posted = PostMessage(ticket.Window, message, key, data);
+                    Log("Signals popup cleanup message=" + message.ToString("X") + " posted=" + posted
+                        + " window=" + ticket.Window.ToInt64().ToString("X"));
+                }, Thread.Sleep);
+            Log("Signals popup cleanup=" + result + "; Signals will not be invoked again");
+            return result;
+        } catch (Exception ex) {
+            // The Signals action has already returned; never turn a cleanup
+            // exception into a failed-action acknowledgement or retry the action.
+            Log("Signals popup cleanup skipped after action: " + ex.Message);
+            return SignalsCleanupResult.Skipped;
+        }
     }
 
     internal static bool SignalsPopupScopeAllowed(bool captureProcess, bool visible, bool sameOwner, bool sameDrawingThread)
@@ -975,28 +1233,30 @@ internal static class OrCADWheelZoom
         IntPtr foreground = IntPtr.Zero, view = IntPtr.Zero;
         var discovered = new HashSet<IntPtr>();
         bool invoked = false;
+        SignalsGestureObserver input = null;
         try {
             Log("Signals request started: " + Version + "; Capture pid=" + capturePid);
             using (var target = Process.GetProcessById(capturePid)) {
                 if (!target.ProcessName.Equals("Capture", StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("Target is not Capture");
             }
             ConfigureDpi(); stateMode = 2;
-            // Alt is commonly still down when the Tcl callback launches us.
+            // No Alt/S-specific release wait. Tcl may remap the binding; the
+            // observer below tolerates original held keys/release, not new input.
             var wait = Stopwatch.StartNew();
-            while (GetAsyncKeyState(0x12) < 0 || GetAsyncKeyState(0x53) < 0) {
-                if (wait.ElapsedMilliseconds > 1500) throw new InvalidOperationException("Release Alt+S and try again");
-                Thread.Sleep(15);
-            }
+            if (GetAsyncKeyState(0x1B) < 0) throw new InvalidOperationException("Signals request cancelled by Escape");
             foreground = GetForegroundWindow();
             uint pid; GetWindowThreadProcessId(foreground, out pid);
             if (pid != capturePid) throw new InvalidOperationException("Capture lost foreground");
             POINT point, logical;
-            if (!GetPhysicalCursorPos(out point) || !Eligible(point, out view, out logical))
+            if (!GetPhysicalCursorPos(out point) || !Eligible(point, out view, out logical, false, true))
                 throw new InvalidOperationException("Keep pointer over the selected network wire in the current drawing");
             var baseline = new HashSet<IntPtr>(CaptureVisibleWindows(foreground, view));
             Log("Window discovery baseline=" + baseline.Count + " foreground=" + foreground + " view=" + view);
-            foreach (int key in modifierKeys) if (GetAsyncKeyState(key) < 0)
-                throw new InvalidOperationException("Release mouse buttons and modifier keys before Alt+S");
+            foreach (int key in modifierKeys) if (ScopeInputBlocks(key, false, true) && GetAsyncKeyState(key) < 0)
+                throw new InvalidOperationException("Release mouse buttons before running Signals");
+            input = new SignalsGestureObserver();
+            int openingCheckpoint = input.State.Generation;
+            Log("Signals gesture observer ready=" + input.Ready);
             uint inserted, cleanup;
             if (!ReplayRightClick(delegate(NativeInput[] inputs) {
                 return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(NativeInput)));
@@ -1023,7 +1283,7 @@ internal static class OrCADWheelZoom
                 || !GetPhysicalCursorPos(out finalPoint) || Math.Abs((long)finalPoint.X-point.X) >= 6
                 || Math.Abs((long)finalPoint.Y-point.Y) >= 6 || GetAsyncKeyState(0x1B) < 0)
                 throw new InvalidOperationException("Signals menu changed or request expired; nothing invoked");
-            foreach (int key in modifierKeys) if (GetAsyncKeyState(key) < 0)
+            foreach (int key in modifierKeys) if (ScopeInputBlocks(key, false, true) && GetAsyncKeyState(key) < 0)
                 throw new InvalidOperationException("New mouse/key gesture cancelled Signals request");
             if (!SignalsAccessibleItemAllowed(item.Parent.get_accName(item.Child), Convert.ToInt32(item.Parent.get_accRole(item.Child)),
                 Convert.ToInt32(item.Parent.get_accState(item.Child)))) throw new InvalidOperationException("Signals item became unavailable");
@@ -1031,12 +1291,17 @@ internal static class OrCADWheelZoom
             // again after the last read; an expired helper must never act later.
             if (wait.ElapsedMilliseconds > 3000 || GetForegroundWindow() != foreground || GetAsyncKeyState(0x1B) < 0)
                 throw new InvalidOperationException("Signals request expired or cancelled during menu readback");
+            if (input.Ready && !input.State.Unchanged(openingCheckpoint))
+                throw new InvalidOperationException("New mouse/key gesture cancelled Signals request");
             // An uncertain action is never retried with 14844; it may have run.
+            SignalsPopupTicket popupTicket = CaptureSignalsPopup(item, baseline, foreground, view, input);
             Log("Invoking accessible Signals menu action: window=" + item.Window.ToInt64().ToString("X") + " class=" + ClassOf(item.Window));
             invoked = true;
             item.Parent.accDoDefaultAction(item.Child);
             Log("Signals menu action returned; native pane result not verified");
-            WriteSignalsResult(resultPath, "signals-invoked"); return 0;
+            SignalsCleanupResult cleanupResult = CompleteSignalsPopup(popupTicket, foreground, view);
+            WriteSignalsResult(resultPath, cleanupResult == SignalsCleanupResult.StillOpen
+                ? "signals-invoked-menu-open" : "signals-invoked"); return 0;
         } catch (Exception ex) {
             Log("Signals menu action failed: " + ex);
             try {WriteSignalsResult(resultPath, "error: " + ex.Message);} catch {}
@@ -1048,6 +1313,7 @@ internal static class OrCADWheelZoom
                 if (SignalsPopupInScope(window, foreground, view))
                     PostMessage(window, 0x001F, IntPtr.Zero, IntPtr.Zero);
             }
+            if (input != null) input.Dispose();
         }
     }
 

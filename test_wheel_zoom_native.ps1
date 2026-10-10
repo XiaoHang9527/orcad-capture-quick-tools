@@ -1,3 +1,5 @@
+[CmdletBinding()]
+param([switch]$SignalsGuardSmoke)
 $ErrorActionPreference = 'Stop'
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
 $testDir = Join-Path $env:TEMP ('OrCADWheelNativeTests-' + [guid]::NewGuid().ToString('N'))
@@ -8,4 +10,8 @@ foreach ($platform in @('x86','x64')) {
     if ($LASTEXITCODE -ne 0) {throw 'Native test compilation failed.'}
     & $testExe
     if ($LASTEXITCODE -ne 0) {throw "Native tests failed: $platform"}
+    if ($SignalsGuardSmoke) {
+        & $testExe --signals-guard-smoke
+        if ($LASTEXITCODE -ne 0) {throw "Signals observer lifecycle tests failed: $platform"}
+    }
 }
