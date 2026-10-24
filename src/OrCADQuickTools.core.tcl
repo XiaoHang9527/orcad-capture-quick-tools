@@ -4,6 +4,7 @@
 # Alt+F3: remove one leading "NC," from selected part values.
 # Alt+F5: replace selected off-page input/output graphics, preserving names.
 # Alt+F6: export selected part pin-to-net data to an Excel workbook.
+# Alt+Shift+F6: export all placed parts on every page of the current DSN.
 # Alt+F7: update every title block Doc and synchronize Title with Page Name.
 # Alt+F8: reannotate the current page from left to right, top to bottom.
 # Alt+F9: reannotate all pages by position using existing page numbers.
@@ -44,6 +45,9 @@ proc ::OrCADQuickTools::ActionDefinitions {} {
         [list "Export Selected Part Pin Net Table To Excel" "Alt+F6" \
             "\u5BFC\u51FA\u6240\u9009\u5668\u4EF6\u7684\u5F15\u811A-\u7F51\u7EDC\u8868 (XLSX)" \
             "::SelectedPinNetExport::Enabler" "::SelectedPinNetExport::Run" "Schematic"] \
+        [list "Export All Design Part Pin Net Table To Excel" "Alt+Shift+F6" \
+            "\u5BFC\u51FA\u5168\u8BBE\u8BA1\u5668\u4EF6\u7684\u5F15\u811A-\u7F51\u7EDC\u8868 (XLSX)" \
+            "::DesignPinNetExport::Enabler" "::DesignPinNetExport::Run" "Schematic"] \
         [list "Synchronize All Title Blocks" "Alt+F7" \
             "\u540C\u6B65\u6240\u6709\u9875\u9762\u6807\u9898\u680F" \
             "::TitleBlockSync::Enabler" "::TitleBlockSync::Run" "Schematic"] \
@@ -74,6 +78,11 @@ proc ::OrCADQuickTools::ActionDefinitions {} {
 namespace eval ::SignalsNavigation {
     if {![info exists Pending]} {variable Pending ""}
     if {![info exists Busy]} {variable Busy 0}
+    if {![info exists ServerDirectory]} {
+        variable ServerDirectory [file join $::env(TEMP) OrCADSignalsServer-[pid]-[clock clicks]]
+    }
+    if {![info exists ServerStarted]} {variable ServerStarted 0}
+    if {![info exists RequestStarted]} {variable RequestStarted 0}
     variable LogFile [file join $::env(TEMP) OrCADSignalsNavigation.log]
 }
 
@@ -161,35 +170,45 @@ proc ::SignalsNavigation::Run {args} {
 proc ::SignalsNavigation::Refresh {snapshot} {
     variable Pending
     variable Busy
+    variable ServerDirectory
+    variable RequestStarted
     set Pending ""
     if {![StillSelected $snapshot]} {Log "Cancelled: selection/page changed before refresh"; return}
-    set resultFile [file join $::env(TEMP) OrCADSignalsContext-[pid]-[clock clicks].result]
+    set resultFile [file join $ServerDirectory request-[clock clicks].result]
+    set RequestStarted [clock clicks -milliseconds]
     if {[catch {StartContext $resultFile} message]} {
         Log "Context helper failed: $message"
         Notice "\u65E0\u6CD5\u5237\u65B0 Signals \u4E0A\u4E0B\u6587\uFF1A\n$message"
         return
     }
     set Busy 1
-    set Pending [after 50 [list ::SignalsNavigation::PollContext $snapshot $resultFile 0]]
+    set Pending [after 20 [list ::SignalsNavigation::PollContext $snapshot $resultFile 0]]
 }
 
 proc ::SignalsNavigation::StartContext {resultFile} {
+    variable ServerDirectory
+    variable ServerStarted
     set helper [file join $::OrCADQuickTools::ScriptDirectory OrCADWheelZoom.exe]
     if {![file exists $helper]} {error "Missing OrCADWheelZoom.exe"}
-    set started [clock clicks -milliseconds]
-    exec $helper --signals-context [pid] $resultFile < NUL >& NUL &
-    Log "Context helper launch returned after [expr {[clock clicks -milliseconds]-$started}] ms"
-    # The GUI helper must enter its own input-idle loop before Tcl's Windows
-    # launcher returns. Only now allow it to inject input into Capture.
-    set ready ""
-    set readyPath "$resultFile.ready"
+    file mkdir $ServerDirectory
+    if {!$ServerStarted} {
+        set started [clock clicks -milliseconds]
+        exec $helper --signals-server [pid] $ServerDirectory < NUL >& NUL &
+        set ServerStarted 1
+        Log "Reusable Signals helper launch returned after [expr {[clock clicks -milliseconds]-$started}] ms"
+    } else {
+        Log "Reusing Signals helper; no process launch"
+    }
+    # Publish atomically AFTER the launcher returns. The server never acts on
+    # staging files, and cannot replay this request after it has been claimed.
+    set f ""
     if {[catch {
-        set ready [open $readyPath {WRONLY CREAT EXCL}]
-        puts -nonewline $ready "capture-ready-v17"
-        close $ready
-        set ready ""
+        set f [open "$resultFile.request-writing" {WRONLY CREAT EXCL}]
+        puts -nonewline $f "capture-ready-v21"
+        close $f; set f ""
+        file rename "$resultFile.request-writing" "$resultFile.request"
     } message]} {
-        if {$ready ne ""} {catch {close $ready}}
+        if {$f ne ""} {catch {close $f}}
         error "Signals launch handshake failed: $message"
     }
 }
@@ -197,6 +216,7 @@ proc ::SignalsNavigation::StartContext {resultFile} {
 proc ::SignalsNavigation::PollContext {snapshot resultFile attempt} {
     variable Pending
     variable Busy
+    variable RequestStarted
     set Pending ""
     set result ""
     if {[file exists $resultFile]} {
@@ -207,11 +227,16 @@ proc ::SignalsNavigation::PollContext {snapshot resultFile attempt} {
         }
         if {$f ne ""} {catch {close $f}}
     }
-    # Release-keys/menu lookup plus bounded popup cleanup can take about 5 s.
-    if {$result eq "" && $attempt < 110} {
-        set Pending [after 50 [list ::SignalsNavigation::PollContext $snapshot $resultFile [expr {$attempt+1}]]]
+    # Cancel pending work if selection changes, before the server acts. Never
+    # launch a replacement process or retry an uncertain native action.
+    if {$result eq "" && ![StillSelected $snapshot]} {
+        catch {set f [open "$resultFile.cancel" w]; close $f}
+    }
+    if {$result eq "" && $attempt < 275 && [expr {[clock clicks -milliseconds]-$RequestStarted}] < 5500} {
+        set Pending [after 20 [list ::SignalsNavigation::PollContext $snapshot $resultFile [expr {$attempt+1}]]]
         return
     }
+    if {$result eq ""} {catch {set f [open "$resultFile.cancel" w]; close $f}}
     set Busy 0
     catch {file delete $resultFile}
     catch {file delete "$resultFile.ready"}
@@ -226,6 +251,7 @@ proc ::SignalsNavigation::PollContext {snapshot resultFile attempt} {
     } else {
         Log "Native Signals menu action returned; requested net=[lindex $snapshot 2] wireId=[lindex $snapshot 1]; pane result not verified"
     }
+    Log "Request acknowledgement after [expr {[clock clicks -milliseconds]-$RequestStarted}] ms"
     if {$result eq "signals-invoked-menu-open"} {
         Log "Signals invoked once, but its popup is still visible; no action retry"
         Notice "Signals \u5DF2\u8C03\u7528\uFF0C\u4F46\u53F3\u952E\u83DC\u5355\u672A\u81EA\u52A8\u6536\u8D77\u3002\n\u8BF7\u6309 Esc \u5173\u95ED\u83DC\u5355\uFF0C\u65E0\u9700\u91CD\u590D\u6267\u884C Alt+S\u3002\n\u8BF7\u63D0\u4F9B OrCADSignalsNavigation-native.log \u4EE5\u4FBF\u5206\u6790\u3002"
@@ -1960,7 +1986,7 @@ proc ::QuickToolsHelp::ShortcutText {} {
     }
     append lText "\n\u5982\u9700\u540C\u65F6\u91CD\u7F6E\u9875\u7801\u548C\u6240\u6709\u4F4D\u53F7\uFF0C\u8BF7\u6309\u987A\u5E8F\u6267\u884C\uFF1A\n1. Alt+F10\n2. Alt+F9"
     append lText "\n\n\u9F20\u6807\u6EDA\u8F6E\uFF1A\u7ED8\u56FE\u533A\u76F4\u63A5\u7F29\u653E\uFF08\u65E0\u9700 Ctrl\uFF09\n\u6309\u4F4F\u53F3\u952E\u62D6\u52A8\uFF1A\u753B\u5E03\u8DDF\u968F\u9F20\u6807\u79FB\u52A8\uFF0C\u677E\u5F00\u505C\u6B62\nAccessories > \u5FEB\u6377\u5DE5\u5177 > \u9F20\u6807\u5BFC\u822A\u5F00\u5173"
-    append lText "\n\nAlt+S\uFF1A\u5355\u9009\u4E00\u6839\u5BFC\u7EBF\uFF0C\u9F20\u6807\u505C\u5728\u7EBF\u4E0A\uFF0C\u6309\u4E0B\u5E76\u677E\u5F00\u5FEB\u6377\u952E\u3002\nAlt+F5\uFF1A\u9009\u4E2D\u8DE8\u9875\u7B26\u53F7\u672C\u4F53\uFF0C\u53EA\u5207\u6362\u56FE\u5F62\uFF0C\u4FDD\u7559\u7F51\u7EDC\u540D\u548C\u8FDE\u63A5\u70B9\u3002\n\u4FEE\u6539\u8BBE\u8BA1\u524D\u8BF7\u5907\u4EFD\uFF0C\u9996\u6B21\u8BF7\u5728\u526F\u672C\u6D4B\u8BD5\u3002\n\u8DE8\u9875\u66FF\u6362\u6062\u590D\u5931\u8D25\u65F6\u52FF\u4FDD\u5B58\uFF0C\u8BF7\u91CD\u5F00\u5907\u4EFD\u3002"
+    append lText "\n\n\u5355\u51FB\u5668\u4EF6\uFF1A\u65E5\u5FD7\u663E\u793A\u53C2\u6570\u3002\nAccessories > \u5FEB\u6377\u5DE5\u5177 > \u5355\u51FB\u5668\u4EF6\u53C2\u6570\u9884\u89C8\u5F00\u5173"
     append lText "\n\n\u4F5C\u8005\uFF1A$AuthorName\n\u8054\u7CFB\u65B9\u5F0F\uFF08VX\uFF09\uFF1A$AuthorWeChat"
     return $lText
 }
@@ -1989,6 +2015,7 @@ proc ::QuickToolsHelp::AddAccessoryMenus {args} {
         ::QuickToolsHelp::AddOneMenuItem "[lindex $lItem 1]    [lindex $lItem 0]" [lindex $lItem 2]
     }
     ::QuickToolsHelp::AddOneMenuItem "\u9F20\u6807\u5BFC\u822A\u5F00\u5173\uFF08\u6EDA\u8F6E\u7F29\u653E/\u53F3\u952E\u5E73\u79FB\uFF09" "::OrCADQuickTools::ToggleWheelZoom"
+    ::QuickToolsHelp::AddOneMenuItem "\u5355\u51FB\u5668\u4EF6\u53C2\u6570\u9884\u89C8\u5F00\u5173" "::PartPreview::Toggle"
 }
 
 # =============================================================================
@@ -2050,4 +2077,7 @@ proc ::OrCADQuickTools::Initialize {} {
         puts "OrCAD quick tools loaded: [join $shortcuts {, }]"
     }
     ::OrCADWheel::Initialize
+    if {[llength [info commands ::PartPreview::Initialize]]} {
+        if {[catch {::PartPreview::Initialize} message]} {puts "Part preview unavailable: $message"}
+    }
 }

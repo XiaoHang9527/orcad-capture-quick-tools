@@ -1,38 +1,43 @@
-# 双文件安装包
+# 最新双文件安装包
 
-最新版本：**2026.10.10 / 鼠标辅助组件 0.20**；主要开发环境：OrCAD Capture 16.6 / Tcl 8.4。
+当前公开版：**2026.10.24**。本目录仅保留本版，不再提供旧安装 ZIP；Git 提交历史不改写。
 
-[下载最新 OrCADQuickTools-2026.10.10-v0.20-runtime.zip](OrCADQuickTools-2026.10.10-v0.20-runtime.zip?raw=true)
+[下载 OrCADQuickTools-2026.10.24-runtime.zip](OrCADQuickTools-2026.10.24-runtime.zip?raw=true)
 
-压缩包中仅包含以下两个运行文件，不含工程、BOM、日志、截图、备份或测试脚本：
+压缩包内仅有两个文件：
 
-- `OrCADQuickTools.tcl`：11 个快捷键、中文帮助、菜单和合并功能模块；跨页图形切换模块 0.2.4。
-- `OrCADWheelZoom.exe`：滚轮缩放、右键拖动及 Signals 辅助；版本 `wheel-0.20-signals-key-independent`。
+- `OrCADQuickTools.tcl`：12 个快捷键、精简中文帮助、参数预览和全部导出/编辑模块；全设计导出 0.1.2、跨页切换 0.2.5。
+- `OrCADWheelZoom.exe`：滚轮/右键平移及 Signals 辅助，版本 `wheel-0.21-signals-reusable`。
 
-0.20 不再固定等待 Alt/S 松开；允许启动时已按住的快捷键重复/首次释放，Signals 返回后立即尝试收起本次匹配菜单。菜单收尾内部等待上限 60 毫秒，不是总显示时间保证，不承诺完全无闪现。默认绑定仍是 Alt+S；Ctrl+F2 等自定义绑定及 Capture 17.4 实机效果待用户确认。
+公开版只配置通用属性，不含组织专用属性名、实际工程、BOM、日志、截图、备份或测试脚本。本机专用配置请另行保管。
 
-保存设计并关闭 Capture，备份旧工具，再将两文件放入同一 `capAutoLoad` 目录。旧独立模块须移出自动加载目录，勿删除软件自带脚本。重启后按 `Alt+F1` 查看帮助。首次使用修改功能仍建议在设计副本上验证。
+## 安装
 
-已将 TCL 自定义为 Ctrl+F2 的用户：可保留自己的兼容 TCL，仅更新包内 0.20 EXE 并重启测试，避免覆盖自定义绑定。不要对源码做不受控的全局替换；后续完整升级须自行合并配置。
+1. 保存设计并关闭 Capture，备份原工具及本机自定义配置。
+2. 将两个文件放入**实际运行版本**的 `tools\capture\tclscripts\capAutoLoad`，不要放到另一套 16.6/17.4 路径。
+3. 移出本工具旧独立模块、重命名备份；勿删除 Capture 自带脚本，也不要把 src/source/test 文件放进自动加载目录。
+4. 两文件配套更新后重启，按 Alt+F1 核对。全设计导出为 **Alt+Shift+F6**，所选器件导出仍为 Alt+F6。
 
-2026.10.10 安装包已通过 Tcl 8.4 隔离加载、XLSX 内容及各功能模拟回归；C# x86/x64 各 433 项策略/结构检查、9 项只读临时监听生命周期检查通过。模拟测试不代表所有 Capture 版本或自定义快捷键已实机验证。
+如果全设计导出报 WriteWorkbook 参数数量错误，在 Capture 中执行：
 
-## SHA-256 校验值
+```tcl
+puts [info args ::OrCADPinNetXlsx::WriteWorkbook]
+```
+
+本版应为 `pOutputFile pRows pTitle`；只有前两个表示运行时仍在使用旧接口，需排查重复脚本或安装路径并重启。本版无需 Microsoft Excel，WPS 可打开生成的 XLSX。
+
+## SHA-256
 
 | 文件 | SHA-256 |
 | --- | --- |
-| OrCADQuickTools-2026.10.10-v0.20-runtime.zip | `2e13ce17570d80fc0bf77792870dae96fd58d360ce4cfd845505c10405cfa6b6` |
-| OrCADQuickTools.tcl（0.20 包，解压后） | `1fd13ecfc7d8c694ecd08a9311a0b556750f54e9ef69d96d6fc893bbe9f6a83b` |
-| OrCADWheelZoom.exe（0.20 包，解压后） | `cb7bfdb73ae9730957966bce5bb4721fe20898b8d57f454e41a03a98a04a33f3` |
+| OrCADQuickTools-2026.10.24-runtime.zip | `467f4c358085b3c0e57f5253d99e8f6fb83042271c21eb6a88be50f87725728b` |
+| OrCADQuickTools.tcl（解压后） | `af453302d7b7ca250ad6719ee943768de5528a51780ff90034542367d248ae2b` |
+| OrCADWheelZoom.exe（解压后） | `b6b57b7e48ec12866e0c56927d5f9605edef8d895ab8a6660534720c94933d29` |
 
-## 历史版本 / 回退
+## 验证范围
 
-[下载 2026.10.09 / 0.17 安装包](OrCADQuickTools-2026.10.09-runtime.zip?raw=true)。回退前保存设计并关闭 Capture，备份当前工具后替换两个文件。
+Tcl 8.4 各模块模拟、双文件加载与 XLSX 包结构测试通过；x86/x64 各 463 项策略/ABI 检查、各 9 项只读监听生命周期检查及 Signals 复用服务动作替身测试通过。这些测试不向 Capture 发送命令，不等于所有软件版本实机验证。
 
-| 文件 | SHA-256 |
-| --- | --- |
-| OrCADQuickTools-2026.10.09-runtime.zip | `d86589d46d55883f6a36775e85395b40e7099f02b54aead31e310233e7ba85d9` |
-| OrCADQuickTools.tcl（解压后） | `1ea0e3cd6a9c2c4c0872cdd0d3a9f5cbd35696245749f60a128cea8c0701a5db` |
-| OrCADWheelZoom.exe（解压后） | `3f9b53f4b0b86d1c9cfda1f04af8cb22d055283828138e483a192ab0050a6afd` |
+主要开发环境为 16.6。旧版 0.20 的 Signals 曾由用户确认在 17.4、Ctrl+F2 下可用；0.21 提速效果、全设计大工程及新导出快捷键的十字光标行为仍需实测，不承诺无菜单闪现或固定响应速度。
 
-更多说明见仓库 [README](../README.md)、[快捷操作速查](../快捷操作速查.md) 和 [更新记录](../CHANGELOG.md)。
+更多内容见 [README](../README.md)、[中文速查](../快捷操作速查.md)、[更新记录](../CHANGELOG.md)。

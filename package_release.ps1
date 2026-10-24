@@ -1,6 +1,6 @@
 # Build a shareable snapshot without old backups, private designs or logs.
 [CmdletBinding()]
-param([string]$ReleaseLabel = '2026.10.10-v0.20', [switch]$RebuildMouseHelper)
+param([string]$ReleaseLabel = '2026.10.24-public', [switch]$RebuildMouseHelper)
 $ErrorActionPreference = 'Stop'
 $quickReferenceName = -join (@(0x5FEB,0x6377,0x64CD,0x4F5C,0x901F,0x67E5) | ForEach-Object { [char]$_ })
 $quickReferenceName += '.md' # ASCII script stays readable by Windows PowerShell 5.1.
@@ -11,10 +11,10 @@ if ($ReleaseLabel -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') {
 $runtimeNames = @('OrCADQuickTools.tcl', 'OrCADWheelZoom.exe')
 $sourceNames = @(
     'OrCADQuickTools.tcl', 'src/OrCADQuickTools.core.tcl',
-    'src/OrCADPinNetXlsx.tcl', 'src/OrCADOffPageToggle.tcl', 'src/OrCADWheelZoom.tcl',
+    'src/OrCADPinNetXlsx.tcl', 'src/OrCADOffPageToggle.tcl', 'src/OrCADWheelZoom.tcl', 'src/OrCADPartPreview.tcl', 'src/OrCADDesignPinNetExport.tcl',
     'OrCADWheelZoom.cs', 'OrCADWheelZoom.manifest',
     'build_tcl_bundle.ps1', 'build_wheel_zoom.ps1', 'package_release.ps1',
-    'test_page_auto_annotate.tcl', 'test_offpage_toggle.tcl', 'test_wheel_zoom.tcl', 'test_signals_navigation.tcl',
+    'test_page_auto_annotate.tcl', 'test_offpage_toggle.tcl', 'test_offpage_session.tcl', 'test_wheel_zoom.tcl', 'test_signals_navigation.tcl', 'test_part_preview.tcl', 'test_design_pin_net.tcl',
     'test_wheel_zoom_native.ps1', 'test_wheel_zoom_native.cs',
     'test_tcl_bundle.ps1', 'test_tcl_bundle.tcl',
     'README.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'EXTENDING.md',

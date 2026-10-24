@@ -4,7 +4,7 @@
 
 运行时只有两个文件：`OrCADQuickTools.tcl` 和 `OrCADWheelZoom.exe`，同目录安装。
 
-合并后的 Tcl 是可读的明文源码，不使用加密、压缩或运行时解包。文件顶部有模块目录；正文依次为核心操作/快捷键配置、XLSX 导出、跨页图形替换、鼠标导航控制；最后统一初始化。各模块有 BEGIN / END 分隔标记，功能函数继续使用各自的命名空间。
+合并后的 Tcl 是可读的明文源码，不使用加密、压缩或运行时解包。文件顶部有模块目录；正文依次为核心操作/快捷键配置、XLSX 导出、跨页图形替换、鼠标导航控制、只读单击参数预览、全设计 PIN—网络采集；最后统一初始化。各模块有 BEGIN / END 分隔标记，功能函数继续使用各自的命名空间。
 
 开发源码保存在 `src`：
 
@@ -14,10 +14,14 @@
 | `src/OrCADPinNetXlsx.tcl` | XLSX 写入 |
 | `src/OrCADOffPageToggle.tcl` | 跨页连接符图形替换 |
 | `src/OrCADWheelZoom.tcl` | 鼠标导航控制 |
+| `src/OrCADPartPreview.tcl` | 单击器件的只读参数显示、字段配置及菜单开关 |
+| `src/OrCADDesignPinNetExport.tcl` | 当前 DSN 全部页面的 PIN—网络表采集与保存 |
 
 开发时优先修改 `src`，再执行 `build_tcl_bundle.ps1` 生成根目录的 `OrCADQuickTools.tcl`。生成文件也能直接修改，但下次构建会覆盖它：直接修改后必须同步回相应 `src` 模块。
 
 ## 新增一个快捷键
+
+只调整单击参数预览字段时，修改 `::PartPreview::Fields` 即可，不需要增加快捷键或改 EXE。每项三个字段：中文显示名（源码用 Unicode 转义）、优先顺序的属性键列表、可选原生读取方法。通用示例为 `[list "Custom field" {User_P/N} {}]`，属性键按字面名称读取。组织专用配置请仅保存在本机，不要提交到公开仓库。构建后运行 `test_part_preview.tcl` 与双文件集成测试。不要在回调中清空日志、调用 `sReleaseAllCreatedPtrs` 或修改器件属性；不得注销共享 `_cdnOrSchViewCmdComplete` 事件，以免影响其他插件。
 
 下面仅为结构示例，不会默认启用或新增快捷键。
 

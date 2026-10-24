@@ -21,6 +21,47 @@ internal static class WheelNativeTests
     }
     static int Run(string[] args)
     {
+        if (args.Length == 1 && args[0] == "--signals-server-smoke") {
+            string root = Path.Combine(Path.GetTempPath(), "OrCADSignalsServerTest-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            int alive = 1, actions = 0;
+            Exception failure = null;
+            var producer = new System.Threading.Thread(delegate() {
+                try {
+                    for (int i=0; i<2; i++) {
+                        string result = Path.Combine(root, "request-" + i + ".result");
+                        File.WriteAllText(result + ".staging", "capture-ready-v21");
+                        File.Move(result + ".staging", result + ".request");
+                        var elapsed = System.Diagnostics.Stopwatch.StartNew();
+                        while (!File.Exists(result) && elapsed.ElapsedMilliseconds < 4000) System.Threading.Thread.Sleep(5);
+                        if (!File.Exists(result)) throw new Exception("Cold/warm watcher request not processed");
+                        Equal(File.ReadAllText(result),"signals-invoked","server fake action acknowledgement");
+                        Console.WriteLine("Mailbox-only " + (i==0 ? "cold" : "warm") + " acknowledgement: " + elapsed.ElapsedMilliseconds + " ms (not Capture latency)");
+                        System.Threading.Thread.Sleep(50);
+                    }
+                } catch (Exception ex) {failure=ex;}
+                finally {System.Threading.Interlocked.Exchange(ref alive,0);}
+            });
+            producer.IsBackground=true;
+            try {
+                producer.Start();
+                OrCADWheelZoom.RunSignalsMailboxLoop(root, delegate {return System.Threading.Interlocked.CompareExchange(ref alive,0,0)==1;},
+                    delegate(string result, Func<bool> valid) {
+                        Equal(valid(),true,"watcher request remains fresh");
+                        System.Threading.Interlocked.Increment(ref actions);
+                        OrCADWheelZoom.WriteSignalsResult(result,"signals-invoked"); return 0;
+                    });
+                producer.Join();
+                if (failure != null) throw failure;
+                Equal(actions,2,"two networks trigger exactly two fake actions, despite duplicate watcher notifications");
+                Equal(Directory.GetFiles(root,"*.working").Length,0,"claimed requests cleaned");
+                Console.WriteLine("PASS: reusable server cold/warm event delivery, exactly-once claim and lifetime exit; no Capture commands/hooks/input.");
+                return 0;
+            } finally {
+                foreach (string file in Directory.GetFiles(root)) File.Delete(file);
+                Directory.Delete(root);
+            }
+        }
         if (args.Length == 1 && args[0] == "--signals-guard-smoke") {
             for (int request=0; request<3; request++) {
                 var observer = new OrCADWheelZoom.SignalsGestureObserver();
@@ -32,6 +73,57 @@ internal static class WheelNativeTests
             Console.WriteLine("PASS: " + checks + " Signals read-only observer lifecycle checks (" + (IntPtr.Size*8)
                 + "-bit); no Capture commands or UI input.");
             return 0;
+        }
+        Equal(OrCADWheelZoom.SignalsRequestFresh(0),true,"new resident request");
+        Equal(OrCADWheelZoom.SignalsRequestFresh(3000),true,"request deadline boundary");
+        Equal(OrCADWheelZoom.SignalsRequestFresh(3001),false,"expired resident request");
+        Equal(OrCADWheelZoom.SignalsRequestFresh(-1),true,"filesystem clock granularity tolerated");
+        Equal(OrCADWheelZoom.SignalsRequestFresh(-101),false,"large future request timestamp rejected");
+        Equal(OrCADWheelZoom.SignalsRequestName("request-123.result.request"),true,"valid request token");
+        Equal(OrCADWheelZoom.SignalsRequestName("request--123.result.request"),true,"Tcl signed clock token");
+        foreach (string bad in new string[] {"request-.result.request","../request-1.result.request","request-1.exe.request","request-x.result.request","request-1.result.request-writing"})
+            Equal(OrCADWheelZoom.SignalsRequestName(bad),false,"invalid request name");
+        Equal(OrCADWheelZoom.SignalsLookupPause(0),10,"fast initial lookup retry");
+        Equal(OrCADWheelZoom.SignalsLookupPause(150),30,"bounded slower fallback retry");
+        uint[] order = OrCADWheelZoom.SignalsObjectOrder(unchecked((uint)-3));
+        Equal(order.Length,3,"cached object category never removes fallback");
+        Equal(order[0],unchecked((uint)-3),"successful menu category preferred");
+        Equal(order[1],unchecked((uint)-4),"CLIENT fallback retained");
+        Equal(order[2],0u,"WINDOW fallback retained");
+        Equal(OrCADWheelZoom.SignalsObjectOrder(123)[0],unchecked((uint)-4),"unknown category not cached");
+        string mailboxRoot = Path.Combine(Path.GetTempPath(),"OrCADSignalsServer-123-test-"+Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(mailboxRoot);
+        try {
+            Equal(OrCADWheelZoom.SignalsServerRootAllowed(mailboxRoot,123),true,"server root in TEMP and matches Capture PID");
+            Equal(OrCADWheelZoom.SignalsServerRootAllowed(mailboxRoot,456),false,"other Capture PID root rejected");
+            int actions = 0;
+            var mailbox = new OrCADWheelZoom.SignalsMailbox(mailboxRoot,delegate(string ackPath, Func<bool> valid) {
+                Equal(valid(),true,"claimed request rechecks deadline/cancel");
+                actions++; OrCADWheelZoom.WriteSignalsResult(ackPath,"signals-invoked"); return 0;
+            });
+            string result = Path.Combine(mailboxRoot,"request-1.result");
+            File.WriteAllText(result+".request-writing","capture-ready-v21"); mailbox.Drain();
+            Equal(actions,0,"partial publication ignored");
+            File.Move(result+".request-writing",result+".request"); mailbox.Drain(); mailbox.Drain();
+            Equal(actions,1,"duplicate rescans invoke once");
+            File.WriteAllText(result+".request","capture-ready-v21"); mailbox.Drain();
+            Equal(actions,1,"existing acknowledgement prevents replay");
+            result = Path.Combine(mailboxRoot,"request-2.result");
+            File.WriteAllText(result+".cancel",""); File.WriteAllText(result+".request","capture-ready-v21"); mailbox.Drain();
+            Equal(actions,1,"cancelled queued request cannot invoke");
+            result = Path.Combine(mailboxRoot,"request-3.result");
+            File.WriteAllText(result+".request","capture-ready-v21"); File.SetLastWriteTimeUtc(result+".request",DateTime.UtcNow.AddSeconds(-10)); mailbox.Drain();
+            Equal(actions,1,"stale queued request cannot invoke");
+            result = Path.Combine(mailboxRoot,"request-4.result");
+            File.WriteAllText(result+".request","capture-ready-v17"); mailbox.Drain();
+            Equal(actions,1,"old request protocol rejected");
+            result = Path.Combine(mailboxRoot,"request-5.result");
+            File.WriteAllText(result+".writing","owned by another request"); File.WriteAllText(result+".request","capture-ready-v21"); mailbox.Drain();
+            Equal(actions,1,"in-progress acknowledgement collision cannot invoke");
+            Equal(Directory.GetFiles(mailboxRoot,"*.working").Length,0,"mailbox claims released");
+        } finally {
+            foreach (string file in Directory.GetFiles(mailboxRoot)) File.Delete(file);
+            Directory.Delete(mailboxRoot);
         }
         Equal(Reason(), "eligible", "hover current schematic");
         var mainRoot = new IntPtr(10); var ownedDrawingRoot = new IntPtr(11); var otherRoot = new IntPtr(12);

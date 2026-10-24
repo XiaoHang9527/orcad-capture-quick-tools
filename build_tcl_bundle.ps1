@@ -6,16 +6,18 @@ $modules = @(
     @{ File = 'OrCADQuickTools.core.tcl'; Title = '01 CORE / ACTION REGISTRY / EDITING OPERATIONS / HELP' },
     @{ File = 'OrCADPinNetXlsx.tcl'; Title = '02 EMBEDDED XLSX WRITER (NO EXCEL DEPENDENCY)' },
     @{ File = 'OrCADOffPageToggle.tcl'; Title = '03 OFF-PAGE INPUT/OUTPUT GRAPHIC TOGGLE' },
-    @{ File = 'OrCADWheelZoom.tcl'; Title = '04 MOUSE NAVIGATION CONTROLLER' }
+    @{ File = 'OrCADWheelZoom.tcl'; Title = '04 MOUSE NAVIGATION CONTROLLER' },
+    @{ File = 'OrCADPartPreview.tcl'; Title = '05 READ-ONLY PART CLICK PREVIEW / CONFIGURABLE FIELDS' },
+    @{ File = 'OrCADDesignPinNetExport.tcl'; Title = '06 ALL-DESIGN PIN-NET EXPORT' }
 )
 $bundle = [System.Text.StringBuilder]::new()
-[void]$bundle.AppendLine('# OrCAD Capture Quick Tools - merged two-file edition, 2026.10.10 / helper 0.20')
+[void]$bundle.AppendLine('# OrCAD Capture Quick Tools - merged two-file edition, 2026.10.24 public / all-design pin-net 0.1.2 / off-page 0.2.5 / part preview 0.1 / helper 0.21')
 [void]$bundle.AppendLine('# Runtime: OrCADQuickTools.tcl + OrCADWheelZoom.exe in the same directory.')
 [void]$bundle.AppendLine('# Tcl 8.4; ASCII source / Unicode-escaped UI; no external Tcl source calls.')
 [void]$bundle.AppendLine('#')
 [void]$bundle.AppendLine('# MODULE INDEX:')
 foreach ($module in $modules) { [void]$bundle.AppendLine('#   ' + $module.Title) }
-[void]$bundle.AppendLine('#   05 INITIALIZATION (runs only after all modules are defined)')
+[void]$bundle.AppendLine('#   07 INITIALIZATION (runs only after all modules are defined)')
 [void]$bundle.AppendLine('#')
 [void]$bundle.AppendLine('# EXTENDING: implement a namespaced command and add one six-field record')
 [void]$bundle.AppendLine('# to ::OrCADQuickTools::ActionDefinitions near the top of module 01.')
@@ -44,7 +46,7 @@ foreach ($module in $modules) {
     [void]$bundle.AppendLine('')
 }
 [void]$bundle.AppendLine('# ============================================================================')
-[void]$bundle.AppendLine('# 05 INITIALIZATION - keep this after ALL module definitions.')
+[void]$bundle.AppendLine('# 07 INITIALIZATION - keep this after ALL module definitions.')
 [void]$bundle.AppendLine('# ============================================================================')
 [void]$bundle.AppendLine('::OrCADQuickTools::Initialize')
 $outputPath = Join-Path $PSScriptRoot 'OrCADQuickTools.tcl'

@@ -122,6 +122,28 @@ proc ::OffPageDirection::LibrarySymbol {lib name} {
     # their suffixes or reinterpret an opaque DboOffPageSymbol pointer.
     return NULL
 }
+proc ::OffPageDirection::CurrentSession {} {
+    # Read the CURRENT borrowed pointer on each lookup. A pointer string is
+    # not necessarily a callable Tcl object until DboSession -this wraps it.
+    # Never construct a new native session, retain it globally, or delete it.
+    if {![info exists ::DboSession_s_pDboSession] || [Null $::DboSession_s_pDboSession]} {
+        error "Capture session is unavailable. Save your work and restart Capture before retrying."
+    }
+    set session $::DboSession_s_pDboSession
+    if {[namespace which -command $session] eq ""} {
+        if {![llength [info commands DboSession]]} {
+            error "Capture session cannot be initialized: DboSession wrapper API is unavailable. Restart Capture before retrying."
+        }
+        if {[catch {DboSession -this $session} why]} {
+            error "Capture session initialization failed: $why. No off-page symbols were replaced."
+        }
+        if {[namespace which -command $session] eq ""} {
+            error "Capture session is still not callable after initialization. Save your work and restart Capture before retrying."
+        }
+        Log "Initialized current Capture session wrapper: $session"
+    }
+    return $session
+}
 proc ::OffPageDirection::Resolve {design pages source target} {
     # Reuse the design's actual symbol definitions, including old library
     # paths that no longer exist on this computer.
@@ -141,10 +163,16 @@ proc ::OffPageDirection::Resolve {design pages source target} {
     if {[string match OFFPAGELEFT-* $target]} {
         lappend paths [file join [file dirname [info nameofexecutable]] library capsym.olb]
     }
+    set session ""
     foreach path $paths {
         if {$path eq "" || ![file isfile $path]} {continue}
+        if {$session eq ""} {set session [CurrentSession]}
         set s [DboState]
-        set lib [$::DboSession_s_pDboSession GetLib [DboTclHelper_sMakeCString $path] $s]
+        if {[catch {$session GetLib [DboTclHelper_sMakeCString $path] $s} lib]} {
+            # Never retry an uncertain native call or silently substitute a
+            # different session. All resolution remains before the first write.
+            error "Cannot read counterpart library $path using the current Capture session: $lib"
+        }
         if {[Null $lib] || ![$s Succeeded]} {continue}
         set sym [LibrarySymbol $lib $target]
         if {![Null $sym]} {return $sym}
@@ -486,7 +514,7 @@ proc ::OffPageDirection::Run {} {
     set Busy 1
     set code [catch {
         set LogFile [file join $::env(TEMP) OrCADOffPageToggle.log]
-        Log "--- [clock format [clock seconds]] version=0.2.4 ---"
+        Log "--- [clock format [clock seconds]] version=0.2.5 ---"
         Execute
     } message]
     set Busy 0

@@ -322,28 +322,31 @@ if {$::references(part2) ne "Q201" || $::occurrenceReferences(occ2) ne "Q201" ||
 puts "PASS: occurrence-visible reference and silent instance write"
 
 ::QuickToolsHelp::AddAccessoryMenus
-if {[llength $::accessoryMenus] != 12} {
-    error "Expected 11 shortcuts plus mouse navigation toggle, got [llength $::accessoryMenus]"
+if {[llength $::accessoryMenus] != 14} {
+    error "Expected 12 shortcuts plus mouse navigation and part preview toggles, got [llength $::accessoryMenus]"
 }
-if {[lindex [lindex $::accessoryMenus end] 2] ne "::QuickToolsHelp::Invoke ::OrCADQuickTools::ToggleWheelZoom"} {
+if {[lindex [lindex $::accessoryMenus end-1] 2] ne "::QuickToolsHelp::Invoke ::OrCADQuickTools::ToggleWheelZoom"} {
     error "Missing mouse navigation toggle menu callback"
 }
-if {[string first "\u9F20\u6807\u5BFC\u822A" [lindex [lindex $::accessoryMenus end] 1]] < 0} {
+if {[string first "\u9F20\u6807\u5BFC\u822A" [lindex [lindex $::accessoryMenus end-1] 1]] < 0} {
     error "Mouse navigation menu label missing"
+}
+if {[lindex [lindex $::accessoryMenus end] 2] ne "::QuickToolsHelp::Invoke ::PartPreview::Toggle"} {
+    error "Missing read-only part preview menu callback"
 }
 if {[string first "\u6309\u4F4F\u53F3\u952E\u62D6\u52A8" [::QuickToolsHelp::ShortcutText]] < 0} {
     error "Right-drag pan help missing"
 }
-foreach lMenuItem [lrange $::accessoryMenus 0 10] {
+foreach lMenuItem [lrange $::accessoryMenus 0 11] {
     if {[lindex $lMenuItem 0] ne $::QuickToolsHelp::MenuName ||
         [string first "Alt+" [lindex $lMenuItem 1]] < 0} {
         error "Invalid Quick Tools menu item: $lMenuItem"
     }
 }
-set lExpectedHotkeys {Alt+F1 Alt+F2 Alt+F3 Alt+F5 Alt+F6 Alt+F7 Alt+F8 Alt+F9 Alt+F10 Alt+R Alt+S}
+set lExpectedHotkeys {Alt+F1 Alt+F2 Alt+F3 Alt+F5 Alt+F6 Alt+Shift+F6 Alt+F7 Alt+F8 Alt+F9 Alt+F10 Alt+R Alt+S}
 set lMenuHotkeys {}
-foreach lMenuItem [lrange $::accessoryMenus 0 10] {
-    if {![regexp {(Alt\+[A-Z][0-9]*)$} [lindex $lMenuItem 1] lHotkey]} {
+foreach lMenuItem [lrange $::accessoryMenus 0 11] {
+    if {![regexp {((?:Ctrl\+)?Alt\+(?:Shift\+)?[A-Z][0-9]*)$} [lindex $lMenuItem 1] lHotkey]} {
         error "Missing shortcut at end of menu label: $lMenuItem"
     }
     lappend lMenuHotkeys $lHotkey
@@ -352,8 +355,8 @@ if {$lMenuHotkeys ne $lExpectedHotkeys} {
     error "Quick Tools menu order: expected $lExpectedHotkeys, got $lMenuHotkeys"
 }
 set lHelpHotkeys {}
-foreach lLine [lrange [split [::QuickToolsHelp::ShortcutText] "\n"] 0 10] {
-    if {![regexp {^(Alt\+[A-Z][0-9]*)[ ]+} $lLine lMatch lHotkey]} {
+foreach lLine [lrange [split [::QuickToolsHelp::ShortcutText] "\n"] 0 11] {
+    if {![regexp {^((?:Ctrl\+)?Alt\+(?:Shift\+)?[A-Z][0-9]*)[ ]+} $lLine lMatch lHotkey]} {
         error "Missing shortcut at start of help line: $lLine"
     }
     lappend lHelpHotkeys $lHotkey

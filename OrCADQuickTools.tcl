@@ -1,4 +1,4 @@
-# OrCAD Capture Quick Tools - merged two-file edition, 2026.10.10 / helper 0.20
+# OrCAD Capture Quick Tools - merged two-file edition, 2026.10.24 public / all-design pin-net 0.1.2 / off-page 0.2.5 / part preview 0.1 / helper 0.21
 # Runtime: OrCADQuickTools.tcl + OrCADWheelZoom.exe in the same directory.
 # Tcl 8.4; ASCII source / Unicode-escaped UI; no external Tcl source calls.
 #
@@ -7,7 +7,9 @@
 #   02 EMBEDDED XLSX WRITER (NO EXCEL DEPENDENCY)
 #   03 OFF-PAGE INPUT/OUTPUT GRAPHIC TOGGLE
 #   04 MOUSE NAVIGATION CONTROLLER
-#   05 INITIALIZATION (runs only after all modules are defined)
+#   05 READ-ONLY PART CLICK PREVIEW / CONFIGURABLE FIELDS
+#   06 ALL-DESIGN PIN-NET EXPORT
+#   07 INITIALIZATION (runs only after all modules are defined)
 #
 # EXTENDING: implement a namespaced command and add one six-field record
 # to ::OrCADQuickTools::ActionDefinitions near the top of module 01.
@@ -25,6 +27,7 @@
 # Alt+F3: remove one leading "NC," from selected part values.
 # Alt+F5: replace selected off-page input/output graphics, preserving names.
 # Alt+F6: export selected part pin-to-net data to an Excel workbook.
+# Alt+Shift+F6: export all placed parts on every page of the current DSN.
 # Alt+F7: update every title block Doc and synchronize Title with Page Name.
 # Alt+F8: reannotate the current page from left to right, top to bottom.
 # Alt+F9: reannotate all pages by position using existing page numbers.
@@ -65,6 +68,9 @@ proc ::OrCADQuickTools::ActionDefinitions {} {
         [list "Export Selected Part Pin Net Table To Excel" "Alt+F6" \
             "\u5BFC\u51FA\u6240\u9009\u5668\u4EF6\u7684\u5F15\u811A-\u7F51\u7EDC\u8868 (XLSX)" \
             "::SelectedPinNetExport::Enabler" "::SelectedPinNetExport::Run" "Schematic"] \
+        [list "Export All Design Part Pin Net Table To Excel" "Alt+Shift+F6" \
+            "\u5BFC\u51FA\u5168\u8BBE\u8BA1\u5668\u4EF6\u7684\u5F15\u811A-\u7F51\u7EDC\u8868 (XLSX)" \
+            "::DesignPinNetExport::Enabler" "::DesignPinNetExport::Run" "Schematic"] \
         [list "Synchronize All Title Blocks" "Alt+F7" \
             "\u540C\u6B65\u6240\u6709\u9875\u9762\u6807\u9898\u680F" \
             "::TitleBlockSync::Enabler" "::TitleBlockSync::Run" "Schematic"] \
@@ -95,6 +101,11 @@ proc ::OrCADQuickTools::ActionDefinitions {} {
 namespace eval ::SignalsNavigation {
     if {![info exists Pending]} {variable Pending ""}
     if {![info exists Busy]} {variable Busy 0}
+    if {![info exists ServerDirectory]} {
+        variable ServerDirectory [file join $::env(TEMP) OrCADSignalsServer-[pid]-[clock clicks]]
+    }
+    if {![info exists ServerStarted]} {variable ServerStarted 0}
+    if {![info exists RequestStarted]} {variable RequestStarted 0}
     variable LogFile [file join $::env(TEMP) OrCADSignalsNavigation.log]
 }
 
@@ -182,35 +193,45 @@ proc ::SignalsNavigation::Run {args} {
 proc ::SignalsNavigation::Refresh {snapshot} {
     variable Pending
     variable Busy
+    variable ServerDirectory
+    variable RequestStarted
     set Pending ""
     if {![StillSelected $snapshot]} {Log "Cancelled: selection/page changed before refresh"; return}
-    set resultFile [file join $::env(TEMP) OrCADSignalsContext-[pid]-[clock clicks].result]
+    set resultFile [file join $ServerDirectory request-[clock clicks].result]
+    set RequestStarted [clock clicks -milliseconds]
     if {[catch {StartContext $resultFile} message]} {
         Log "Context helper failed: $message"
         Notice "\u65E0\u6CD5\u5237\u65B0 Signals \u4E0A\u4E0B\u6587\uFF1A\n$message"
         return
     }
     set Busy 1
-    set Pending [after 50 [list ::SignalsNavigation::PollContext $snapshot $resultFile 0]]
+    set Pending [after 20 [list ::SignalsNavigation::PollContext $snapshot $resultFile 0]]
 }
 
 proc ::SignalsNavigation::StartContext {resultFile} {
+    variable ServerDirectory
+    variable ServerStarted
     set helper [file join $::OrCADQuickTools::ScriptDirectory OrCADWheelZoom.exe]
     if {![file exists $helper]} {error "Missing OrCADWheelZoom.exe"}
-    set started [clock clicks -milliseconds]
-    exec $helper --signals-context [pid] $resultFile < NUL >& NUL &
-    Log "Context helper launch returned after [expr {[clock clicks -milliseconds]-$started}] ms"
-    # The GUI helper must enter its own input-idle loop before Tcl's Windows
-    # launcher returns. Only now allow it to inject input into Capture.
-    set ready ""
-    set readyPath "$resultFile.ready"
+    file mkdir $ServerDirectory
+    if {!$ServerStarted} {
+        set started [clock clicks -milliseconds]
+        exec $helper --signals-server [pid] $ServerDirectory < NUL >& NUL &
+        set ServerStarted 1
+        Log "Reusable Signals helper launch returned after [expr {[clock clicks -milliseconds]-$started}] ms"
+    } else {
+        Log "Reusing Signals helper; no process launch"
+    }
+    # Publish atomically AFTER the launcher returns. The server never acts on
+    # staging files, and cannot replay this request after it has been claimed.
+    set f ""
     if {[catch {
-        set ready [open $readyPath {WRONLY CREAT EXCL}]
-        puts -nonewline $ready "capture-ready-v17"
-        close $ready
-        set ready ""
+        set f [open "$resultFile.request-writing" {WRONLY CREAT EXCL}]
+        puts -nonewline $f "capture-ready-v21"
+        close $f; set f ""
+        file rename "$resultFile.request-writing" "$resultFile.request"
     } message]} {
-        if {$ready ne ""} {catch {close $ready}}
+        if {$f ne ""} {catch {close $f}}
         error "Signals launch handshake failed: $message"
     }
 }
@@ -218,6 +239,7 @@ proc ::SignalsNavigation::StartContext {resultFile} {
 proc ::SignalsNavigation::PollContext {snapshot resultFile attempt} {
     variable Pending
     variable Busy
+    variable RequestStarted
     set Pending ""
     set result ""
     if {[file exists $resultFile]} {
@@ -228,11 +250,16 @@ proc ::SignalsNavigation::PollContext {snapshot resultFile attempt} {
         }
         if {$f ne ""} {catch {close $f}}
     }
-    # Release-keys/menu lookup plus bounded popup cleanup can take about 5 s.
-    if {$result eq "" && $attempt < 110} {
-        set Pending [after 50 [list ::SignalsNavigation::PollContext $snapshot $resultFile [expr {$attempt+1}]]]
+    # Cancel pending work if selection changes, before the server acts. Never
+    # launch a replacement process or retry an uncertain native action.
+    if {$result eq "" && ![StillSelected $snapshot]} {
+        catch {set f [open "$resultFile.cancel" w]; close $f}
+    }
+    if {$result eq "" && $attempt < 275 && [expr {[clock clicks -milliseconds]-$RequestStarted}] < 5500} {
+        set Pending [after 20 [list ::SignalsNavigation::PollContext $snapshot $resultFile [expr {$attempt+1}]]]
         return
     }
+    if {$result eq ""} {catch {set f [open "$resultFile.cancel" w]; close $f}}
     set Busy 0
     catch {file delete $resultFile}
     catch {file delete "$resultFile.ready"}
@@ -247,6 +274,7 @@ proc ::SignalsNavigation::PollContext {snapshot resultFile attempt} {
     } else {
         Log "Native Signals menu action returned; requested net=[lindex $snapshot 2] wireId=[lindex $snapshot 1]; pane result not verified"
     }
+    Log "Request acknowledgement after [expr {[clock clicks -milliseconds]-$RequestStarted}] ms"
     if {$result eq "signals-invoked-menu-open"} {
         Log "Signals invoked once, but its popup is still visible; no action retry"
         Notice "Signals \u5DF2\u8C03\u7528\uFF0C\u4F46\u53F3\u952E\u83DC\u5355\u672A\u81EA\u52A8\u6536\u8D77\u3002\n\u8BF7\u6309 Esc \u5173\u95ED\u83DC\u5355\uFF0C\u65E0\u9700\u91CD\u590D\u6267\u884C Alt+S\u3002\n\u8BF7\u63D0\u4F9B OrCADSignalsNavigation-native.log \u4EE5\u4FBF\u5206\u6790\u3002"
@@ -1981,7 +2009,7 @@ proc ::QuickToolsHelp::ShortcutText {} {
     }
     append lText "\n\u5982\u9700\u540C\u65F6\u91CD\u7F6E\u9875\u7801\u548C\u6240\u6709\u4F4D\u53F7\uFF0C\u8BF7\u6309\u987A\u5E8F\u6267\u884C\uFF1A\n1. Alt+F10\n2. Alt+F9"
     append lText "\n\n\u9F20\u6807\u6EDA\u8F6E\uFF1A\u7ED8\u56FE\u533A\u76F4\u63A5\u7F29\u653E\uFF08\u65E0\u9700 Ctrl\uFF09\n\u6309\u4F4F\u53F3\u952E\u62D6\u52A8\uFF1A\u753B\u5E03\u8DDF\u968F\u9F20\u6807\u79FB\u52A8\uFF0C\u677E\u5F00\u505C\u6B62\nAccessories > \u5FEB\u6377\u5DE5\u5177 > \u9F20\u6807\u5BFC\u822A\u5F00\u5173"
-    append lText "\n\nAlt+S\uFF1A\u5355\u9009\u4E00\u6839\u5BFC\u7EBF\uFF0C\u9F20\u6807\u505C\u5728\u7EBF\u4E0A\uFF0C\u6309\u4E0B\u5E76\u677E\u5F00\u5FEB\u6377\u952E\u3002\nAlt+F5\uFF1A\u9009\u4E2D\u8DE8\u9875\u7B26\u53F7\u672C\u4F53\uFF0C\u53EA\u5207\u6362\u56FE\u5F62\uFF0C\u4FDD\u7559\u7F51\u7EDC\u540D\u548C\u8FDE\u63A5\u70B9\u3002\n\u4FEE\u6539\u8BBE\u8BA1\u524D\u8BF7\u5907\u4EFD\uFF0C\u9996\u6B21\u8BF7\u5728\u526F\u672C\u6D4B\u8BD5\u3002\n\u8DE8\u9875\u66FF\u6362\u6062\u590D\u5931\u8D25\u65F6\u52FF\u4FDD\u5B58\uFF0C\u8BF7\u91CD\u5F00\u5907\u4EFD\u3002"
+    append lText "\n\n\u5355\u51FB\u5668\u4EF6\uFF1A\u65E5\u5FD7\u663E\u793A\u53C2\u6570\u3002\nAccessories > \u5FEB\u6377\u5DE5\u5177 > \u5355\u51FB\u5668\u4EF6\u53C2\u6570\u9884\u89C8\u5F00\u5173"
     append lText "\n\n\u4F5C\u8005\uFF1A$AuthorName\n\u8054\u7CFB\u65B9\u5F0F\uFF08VX\uFF09\uFF1A$AuthorWeChat"
     return $lText
 }
@@ -2010,6 +2038,7 @@ proc ::QuickToolsHelp::AddAccessoryMenus {args} {
         ::QuickToolsHelp::AddOneMenuItem "[lindex $lItem 1]    [lindex $lItem 0]" [lindex $lItem 2]
     }
     ::QuickToolsHelp::AddOneMenuItem "\u9F20\u6807\u5BFC\u822A\u5F00\u5173\uFF08\u6EDA\u8F6E\u7F29\u653E/\u53F3\u952E\u5E73\u79FB\uFF09" "::OrCADQuickTools::ToggleWheelZoom"
+    ::QuickToolsHelp::AddOneMenuItem "\u5355\u51FB\u5668\u4EF6\u53C2\u6570\u9884\u89C8\u5F00\u5173" "::PartPreview::Toggle"
 }
 
 # =============================================================================
@@ -2071,6 +2100,9 @@ proc ::OrCADQuickTools::Initialize {} {
         puts "OrCAD quick tools loaded: [join $shortcuts {, }]"
     }
     ::OrCADWheel::Initialize
+    if {[llength [info commands ::PartPreview::Initialize]]} {
+        if {[catch {::PartPreview::Initialize} message]} {puts "Part preview unavailable: $message"}
+    }
 }
 # END MODULE: 01 CORE / ACTION REGISTRY / EDITING OPERATIONS / HELP
 
@@ -2226,7 +2258,7 @@ proc ::OrCADPinNetXlsx::InlineCell {pReference pValue pStyle} {
     return "<c r=\"$pReference\" s=\"$pStyle\" t=\"inlineStr\"><is><t xml:space=\"preserve\">$lValue</t></is></c>"
 }
 
-proc ::OrCADPinNetXlsx::BuildSheet {pRows} {
+proc ::OrCADPinNetXlsx::BuildSheet {pRows {pTitle {Selected Part Pin-Net Table}}} {
     array set lGroupIndex {}
     array set lGroupRows {}
     array set lGroupInfo {}
@@ -2234,7 +2266,7 @@ proc ::OrCADPinNetXlsx::BuildSheet {pRows} {
 
     foreach lRow $pRows {
         set lInfo [lrange $lRow 0 2]
-        set lKey [join $lInfo "\u001f"]
+        set lKey [list $lInfo [lindex $lRow 7]]
         if {![info exists lGroupIndex($lKey)]} {
             set lIndex $lGroupCount
             set lGroupIndex($lKey) $lIndex
@@ -2249,6 +2281,7 @@ proc ::OrCADPinNetXlsx::BuildSheet {pRows} {
 
     set lPinCount [llength $pRows]
     set lLastRow [expr {$lPinCount + (3 * $lGroupCount) + 2}]
+    if {$lLastRow > 1048576} {error "The export exceeds the XLSX worksheet row limit. Export a smaller scope."}
     set lExportedAt [clock format [clock seconds] -format "%Y-%m-%d %H:%M:%S"]
     set lHeaders [list "Pin Number" "Pin Name" "Net Name" "Connection"]
     set lColumns [list A B C D]
@@ -2261,7 +2294,7 @@ proc ::OrCADPinNetXlsx::BuildSheet {pRows} {
     append lSheet {<cols><col min="1" max="1" width="14" customWidth="1"/><col min="2" max="2" width="58" customWidth="1"/><col min="3" max="3" width="38" customWidth="1"/><col min="4" max="4" width="15" customWidth="1"/><col min="5" max="5" width="12" customWidth="1"/><col min="6" max="6" width="28" customWidth="1"/></cols>}
     append lSheet {<sheetData>}
     append lSheet {<row r="1" ht="24" customHeight="1">}
-    append lSheet [::OrCADPinNetXlsx::InlineCell A1 "Selected Part Pin-Net Table" 1]
+    append lSheet [::OrCADPinNetXlsx::InlineCell A1 $pTitle 1]
     append lSheet {</row>}
     append lSheet {<row r="2">}
     append lSheet [::OrCADPinNetXlsx::InlineCell A2 Exported 2]
@@ -2330,7 +2363,7 @@ proc ::OrCADPinNetXlsx::BuildSheet {pRows} {
     return $lSheet
 }
 
-proc ::OrCADPinNetXlsx::WriteWorkbook {pOutputFile pRows} {
+proc ::OrCADPinNetXlsx::WriteWorkbook {pOutputFile pRows {pTitle {Selected Part Pin-Net Table}}} {
     if {[llength $pRows] == 0} {
         error "The export contains no pin rows."
     }
@@ -2339,7 +2372,7 @@ proc ::OrCADPinNetXlsx::WriteWorkbook {pOutputFile pRows} {
         error "The output directory does not exist: $lOutputDirectory"
     }
 
-    set lSheetXml [::OrCADPinNetXlsx::BuildSheet $pRows]
+    set lSheetXml [::OrCADPinNetXlsx::BuildSheet $pRows $pTitle]
     set lCreatedUtc [clock format [clock seconds] -gmt true -format "%Y-%m-%dT%H:%M:%SZ"]
 
     set lContentTypes {<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/><Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/></Types>}
@@ -2350,6 +2383,7 @@ proc ::OrCADPinNetXlsx::WriteWorkbook {pOutputFile pRows} {
     set lApp {<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>OrCAD Quick Tools</Application><DocSecurity>0</DocSecurity><ScaleCrop>false</ScaleCrop><HeadingPairs><vt:vector size="2" baseType="variant"><vt:variant><vt:lpstr>Worksheets</vt:lpstr></vt:variant><vt:variant><vt:i4>1</vt:i4></vt:variant></vt:vector></HeadingPairs><TitlesOfParts><vt:vector size="1" baseType="lpstr"><vt:lpstr>Pin Net</vt:lpstr></vt:vector></TitlesOfParts><Company></Company><LinksUpToDate>false</LinksUpToDate><SharedDoc>false</SharedDoc><HyperlinksChanged>false</HyperlinksChanged><AppVersion>1.0</AppVersion></Properties>}
     set lCore "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\" xmlns:dcmitype=\"http://purl.org/dc/dcmitype/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"><dc:title>Selected Part Pin-Net Table</dc:title><dc:creator>OrCAD Quick Tools</dc:creator><cp:lastModifiedBy>OrCAD Quick Tools</cp:lastModifiedBy><dcterms:created xsi:type=\"dcterms:W3CDTF\">$lCreatedUtc</dcterms:created><dcterms:modified xsi:type=\"dcterms:W3CDTF\">$lCreatedUtc</dcterms:modified></cp:coreProperties>"
 
+    set lCore [string map [list {Selected Part Pin-Net Table} [::OrCADPinNetXlsx::XmlEscape $pTitle]] $lCore]
     set lEntries [list \
         [list {[Content_Types].xml} $lContentTypes] \
         [list {_rels/.rels} $lRootRels] \
@@ -2506,6 +2540,28 @@ proc ::OffPageDirection::LibrarySymbol {lib name} {
     # their suffixes or reinterpret an opaque DboOffPageSymbol pointer.
     return NULL
 }
+proc ::OffPageDirection::CurrentSession {} {
+    # Read the CURRENT borrowed pointer on each lookup. A pointer string is
+    # not necessarily a callable Tcl object until DboSession -this wraps it.
+    # Never construct a new native session, retain it globally, or delete it.
+    if {![info exists ::DboSession_s_pDboSession] || [Null $::DboSession_s_pDboSession]} {
+        error "Capture session is unavailable. Save your work and restart Capture before retrying."
+    }
+    set session $::DboSession_s_pDboSession
+    if {[namespace which -command $session] eq ""} {
+        if {![llength [info commands DboSession]]} {
+            error "Capture session cannot be initialized: DboSession wrapper API is unavailable. Restart Capture before retrying."
+        }
+        if {[catch {DboSession -this $session} why]} {
+            error "Capture session initialization failed: $why. No off-page symbols were replaced."
+        }
+        if {[namespace which -command $session] eq ""} {
+            error "Capture session is still not callable after initialization. Save your work and restart Capture before retrying."
+        }
+        Log "Initialized current Capture session wrapper: $session"
+    }
+    return $session
+}
 proc ::OffPageDirection::Resolve {design pages source target} {
     # Reuse the design's actual symbol definitions, including old library
     # paths that no longer exist on this computer.
@@ -2525,10 +2581,16 @@ proc ::OffPageDirection::Resolve {design pages source target} {
     if {[string match OFFPAGELEFT-* $target]} {
         lappend paths [file join [file dirname [info nameofexecutable]] library capsym.olb]
     }
+    set session ""
     foreach path $paths {
         if {$path eq "" || ![file isfile $path]} {continue}
+        if {$session eq ""} {set session [CurrentSession]}
         set s [DboState]
-        set lib [$::DboSession_s_pDboSession GetLib [DboTclHelper_sMakeCString $path] $s]
+        if {[catch {$session GetLib [DboTclHelper_sMakeCString $path] $s} lib]} {
+            # Never retry an uncertain native call or silently substitute a
+            # different session. All resolution remains before the first write.
+            error "Cannot read counterpart library $path using the current Capture session: $lib"
+        }
         if {[Null $lib] || ![$s Succeeded]} {continue}
         set sym [LibrarySymbol $lib $target]
         if {![Null $sym]} {return $sym}
@@ -2870,7 +2932,7 @@ proc ::OffPageDirection::Run {} {
     set Busy 1
     set code [catch {
         set LogFile [file join $::env(TEMP) OrCADOffPageToggle.log]
-        Log "--- [clock format [clock seconds]] version=0.2.4 ---"
+        Log "--- [clock format [clock seconds]] version=0.2.5 ---"
         Execute
     } message]
     set Busy 0
@@ -3140,6 +3202,396 @@ proc ::OrCADWheel::Initialize {} {
 # END MODULE: 04 MOUSE NAVIGATION CONTROLLER
 
 # ============================================================================
-# 05 INITIALIZATION - keep this after ALL module definitions.
+# BEGIN MODULE: 05 READ-ONLY PART CLICK PREVIEW / CONFIGURABLE FIELDS
+# Development source: src/OrCADPartPreview.tcl
+# ============================================================================
+# Read-only part preview, Tcl 8.4. No polling, EXE, design writes or global
+# pointer cleanup. Triggered by Capture's native OnLButtonUp completion event.
+namespace eval ::PartPreview {
+    foreach {name value} {Enabled 1 Initialized 0 Registered 0 Pending {} Busy 0 LastSignature {} LastError {}} {
+        if {![info exists $name]} {variable $name $value}
+    }
+    set base $::env(TEMP)
+    if {[info exists ::env(LOCALAPPDATA)]} {set base $::env(LOCALAPPDATA)}
+    variable Preference [file join $base OrCADQuickTools part-preview.enabled]
+}
+
+# Extension point: label, effective-property aliases (in priority order),
+# optional native string getter. Add organization-specific keys only locally.
+proc ::PartPreview::Fields {} {
+    return [list \
+        [list "\u4F4D\u53F7" {Reference {Part Reference}} GetReference] \
+        [list Value {Value} GetPartValue] \
+        [list "\u5C01\u88C5" {{PCB Footprint} {PCB FOOTPRINT} Footprint} {}] \
+        [list "\u63CF\u8FF0" {Description DESCRIPTION} {}] \
+        [list "\u7269\u6599\u7F16\u7801" {{Part Number} Part_Number MPN {Manufacturer Part Number}} {}] \
+        [list "\u5382\u5BB6" {Manufacturer MANUFACTURER MFR} {}]]
+}
+
+proc ::PartPreview::FreeString {pointer} {
+    if {$pointer ne "" && [llength [info commands DboTclHelper_sDeleteCString]]} {
+        catch {DboTclHelper_sDeleteCString $pointer}
+    }
+}
+
+proc ::PartPreview::ReadString {object property {getter {}}} {
+    set name ""; set value ""; set status ""; set text ""
+    set code [catch {
+        set value [DboTclHelper_sMakeCString]
+        if {$getter eq ""} {
+            set name [DboTclHelper_sMakeCString $property]
+            set status [$object GetEffectivePropStringValue $name $value]
+        } else {
+            set status [$object $getter $value]
+        }
+        # Some string getters return void; effective-property reads return a
+        # DboState. Failed states must not expose a partially filled buffer.
+        set okay 1
+        if {$status ne "" && $status ne "NULL"} {
+            if {![catch {$status OK} result]} {set okay $result}
+        }
+        if {$okay} {set text [DboTclHelper_sGetConstCharPtr $value]}
+    } message]
+    FreeString $name
+    FreeString $value
+    if {$status ne "" && $status ne "NULL"} {catch {$status -delete}}
+    if {$code} {return ""}
+    return [string trim $text]
+}
+
+proc ::PartPreview::Clean {text} {
+    set text [string map [list "\r" " " "\n" " " "\t" " "] $text]
+    regsub -all {[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]} $text {} text
+    if {[string length $text] > 1000} {set text "[string range $text 0 999]..."}
+    return $text
+}
+
+proc ::PartPreview::Identity {} {
+    if {![IsSchematicViewActive]} {return {}}
+    set objects [GetSelectedObjects]
+    if {[llength $objects] != 1} {return {}}
+    set object [lindex $objects 0]
+    set placed 13
+    if {[info exists ::DboBaseObject_PLACED_INSTANCE]} {set placed $::DboBaseObject_PLACED_INSTANCE}
+    if {[DboBaseObject_GetObjectType $object] != $placed} {return {}}
+    set page [GetActivePage]
+    if {$page eq "" || $page eq "NULL"} {return {}}
+    set state [DboState]
+    set code [catch {
+        set id [$object GetId $state]
+        if {![$state OK]} {error "Cannot read selected part ID"}
+    } message]
+    catch {$state -delete}
+    if {$code} {error $message}
+    return [list $page $object $id]
+}
+
+proc ::PartPreview::Emit {message} {
+    # Preserve other tools' diagnostics. Never clear the log or change focus.
+    puts $message
+    if {[llength [info commands DboState_WriteToSessionLog]]} {
+        set text ""
+        catch {
+            set text [DboTclHelper_sMakeCString $message]
+            DboState_WriteToSessionLog $text
+        }
+        FreeString $text
+    }
+}
+
+proc ::PartPreview::Display {} {
+    variable LastSignature
+    set identity [Identity]
+    if {![llength $identity]} {set LastSignature ""; return}
+    set object [lindex $identity 1]
+    set lines {}
+    foreach field [Fields] {
+        foreach {label aliases getter} $field break
+        set value ""
+        foreach alias $aliases {
+            set value [ReadString $object $alias]
+            if {$value ne ""} {break}
+        }
+        if {$value eq "" && $getter ne ""} {set value [ReadString $object {} $getter]}
+        if {$value ne ""} {lappend lines "$label\uFF1A[Clean $value]"}
+    }
+    if {![llength $lines]} {return}
+    # Re-read selection rather than retaining a database pointer across idle
+    # callbacks. Refuse output if a nested editor operation changed the target.
+    if {[Identity] ne $identity} {return}
+    set signature [list $identity $lines]
+    if {$signature eq $LastSignature} {return}
+    set message "----- \u5668\u4EF6\u53C2\u6570 -----\n[join $lines \n]\n--------------------"
+    Emit $message
+    set LastSignature $signature
+}
+
+proc ::PartPreview::Flush {} {
+    variable Pending; variable Busy; variable Enabled; variable LastError
+    set Pending ""
+    if {!$Enabled || $Busy} {return}
+    set Busy 1
+    set code [catch {Display} message]
+    set Busy 0
+    if {$code} {
+        if {$message ne $LastError} {catch {puts "Part preview: $message"}; set LastError $message}
+    } else {set LastError ""}
+}
+
+proc ::PartPreview::NeedsCallback {command args} {
+    variable Enabled; variable Busy
+    return [expr {$Enabled && !$Busy && $command eq "OnLButtonUp"}]
+}
+
+proc ::PartPreview::OnCommand {command args} {
+    variable Pending
+    if {![NeedsCallback $command]} {return}
+    # Do not read DB objects inside Capture's mouse handler. Collapse a burst
+    # of callbacks into one current-selection read after the command completes.
+    if {$Pending ne ""} {after cancel $Pending}
+    set Pending [after idle ::PartPreview::Flush]
+}
+
+proc ::PartPreview::Toggle {} {
+    variable Enabled; variable Preference; variable Pending; variable LastSignature
+    set Enabled [expr {!$Enabled}]
+    if {$Pending ne ""} {after cancel $Pending; set Pending ""}
+    set LastSignature ""
+    set f ""; set staging "$Preference.[pid]-[clock clicks].tmp"
+    if {[catch {
+        file mkdir [file dirname $Preference]
+        set f [open $staging {WRONLY CREAT EXCL}]
+        puts -nonewline $f $Enabled
+        close $f; set f ""
+        file rename -force $staging $Preference
+    } message]} {
+        if {$f ne ""} {catch {close $f}}
+        catch {file delete $staging}
+        puts "Part preview: preference could not be saved: $message"
+    }
+    if {$Enabled} {puts "\u5668\u4EF6\u53C2\u6570\u9884\u89C8\uFF1A\u5DF2\u5F00\u542F"} \
+    else {puts "\u5668\u4EF6\u53C2\u6570\u9884\u89C8\uFF1A\u5DF2\u5173\u95ED"}
+}
+
+proc ::PartPreview::Initialize {} {
+    variable Registered; variable Initialized; variable Preference; variable Enabled
+    if {![llength [info commands RegisterAction]]} {return}
+    if {!$Initialized} {
+        set Initialized 1
+        set f ""
+        catch {
+            if {[file exists $Preference]} {
+                set f [open $Preference r]; set saved [string trim [read $f 16]]
+                close $f; set f ""
+                if {$saved eq "0" || $saved eq "1"} {set Enabled $saved}
+            }
+        }
+        if {$f ne ""} {catch {close $f}}
+    }
+    if {!$Registered} {
+        RegisterAction "_cdnOrSchViewCmdComplete" "::PartPreview::NeedsCallback" "" "::PartPreview::OnCommand" ""
+        set Registered 1
+    }
+}
+# END MODULE: 05 READ-ONLY PART CLICK PREVIEW / CONFIGURABLE FIELDS
+
+# ============================================================================
+# BEGIN MODULE: 06 ALL-DESIGN PIN-NET EXPORT
+# Development source: src/OrCADDesignPinNetExport.tcl
+# ============================================================================
+# Tcl 8.4: read every schematic page of the current DSN. No selection changes,
+# annotation, netlist regeneration, Excel automation or external processes.
+namespace eval ::DesignPinNetExport {
+    if {![info exists Busy]} {variable Busy 0}
+}
+
+proc ::DesignPinNetExport::Null {object} {expr {$object eq "" || $object eq "NULL"}}
+proc ::DesignPinNetExport::Design {} {
+    # Prefer the visible page's owner over a stale Project Manager selection.
+    if {![catch {IsSchematicViewActive} active] && $active} {
+        set page [GetActivePage]
+        if {![Null $page]} {
+            set lib [$page GetContainingLib]
+            if {[llength [info commands DboLibToDboDesign]]} {return [DboLibToDboDesign $lib]}
+            return $lib
+        }
+    }
+    set design [GetActivePMDesign]
+    if {[Null $design]} {error "Select a design (.dsn) or open a schematic page first."}
+    return $design
+}
+proc ::DesignPinNetExport::Enabler {args} {
+    variable Busy
+    return [expr {!$Busy && ![catch {Design} design] && ![Null $design]}]
+}
+proc ::DesignPinNetExport::Check {state stage} {
+    if {![$state Succeeded]} {error "$stage failed (Capture status [$state Code]); export stopped, not silently truncated."}
+}
+proc ::DesignPinNetExport::Objects {owner create next destroy args} {
+    set iterator ""; set state ""; set objects {}
+    set code [catch {
+        set state [DboState]
+        set iterator [eval [linsert $args 0 $owner $create $state]]
+        Check $state $create
+        $state -delete; set state ""
+        if {[Null $iterator]} {error "$create returned no iterator."}
+        array set seen {}
+        while {1} {
+            set state [DboState]
+            set object [$iterator $next $state]
+            set end [expr {[Null $object] && ([$state Succeeded] || [$state Code]==1022)}]
+            if {!$end} {Check $state $next}
+            $state -delete; set state ""
+            if {$end} {break}
+            if {[info exists seen($object)]} {error "$next repeated an object; export stopped."}
+            set seen($object) 1
+            lappend objects $object
+        }
+    } message]
+    if {$state ne ""} {catch {$state -delete}}
+    if {![Null $iterator]} {catch {$destroy $iterator}}
+    if {$code} {error $message}
+    return $objects
+}
+proc ::DesignPinNetExport::String {object method} {
+    set value ""; set status ""
+    set code [catch {
+        set value [DboTclHelper_sMakeCString]
+        set status [$object $method $value]
+        if {![Null $status] && [namespace which -command $status] ne ""} {Check $status $method}
+        set result [DboTclHelper_sGetConstCharPtr $value]
+    } message]
+    if {$value ne "" && [llength [info commands DboTclHelper_sDeleteCString]]} {catch {DboTclHelper_sDeleteCString $value}}
+    if {![Null $status]} {catch {$status -delete}}
+    if {$code} {error "$method: $message"}
+    return $result
+}
+proc ::DesignPinNetExport::NetName {pin} {
+    set failures {}
+    foreach method {GetNet GetWire} {
+        set state [DboState]
+        set code [catch {
+            set object [$pin $method $state]
+            if {[Null $object]} {
+                # Capture's orSMIDB_DLL.xml: 1021 = Object Not Found;
+                # 1043 = not connected to any Net. Either can accompany a
+                # NULL lookup for an unconnected pin. Still check GetWire:
+                # absence in GetNet alone does NOT prove disconnection.
+                # Accept these codes only for NULL network/wire lookups,
+                # never for a returned object, iterator or property read.
+                if {![$state Succeeded] && [$state Code]!=1021 && [$state Code]!=1043} {Check $state $method}
+                set name ""
+            } else {
+                Check $state $method
+                set name [String $object GetNetName]
+                if {$name eq ""} {error "$method returned an unnamed connection"}
+            }
+        } message]
+        catch {$state -delete}
+        if {$code} {lappend failures $message} elseif {$name ne ""} {return $name}
+    }
+    if {[llength $failures]} {error "Cannot determine pin network: [join $failures {; }]"}
+    return ""
+}
+proc ::DesignPinNetExport::Collect {design statsName} {
+    upvar 1 $statsName stats
+    array set stats {pages 0 parts 0 pins 0 noPins 0 skipped 0}
+    if {[catch {$design DesignHasReusedSchematics} reused]} {
+        error "Cannot verify whether this design reuses hierarchical pages; export stopped to avoid missing occurrences."
+    }
+    if {$reused} {
+        error "This design reuses hierarchical schematics. A page-instance export would omit occurrence-specific references/nets; flattened occurrence export is not supported yet. No workbook was written."
+    }
+    set pages {}
+    foreach view [Objects $design NewViewsIter NextView delete_DboLibViewsIter $::IterDefs_SCHEMATICS] {
+        set schematic [DboViewToDboSchematic $view]
+        if {[Null $schematic]} {error "Cannot read a schematic view; export stopped."}
+        set schematicName [String $schematic GetName]
+        foreach page [Objects $schematic NewPagesIter NextPage delete_DboSchematicPagesIter] {
+            set pageName [String $page GetName]
+            lappend pages [list "$schematicName / $pageName" $page]
+        }
+    }
+    set rows {}; array set seenPages {}
+    foreach pageRecord [lsort -dictionary -index 0 $pages] {
+        foreach {pageName page} $pageRecord break
+        if {[info exists seenPages($page)]} {continue}
+        set seenPages($page) 1; incr stats(pages)
+        set parts {}
+        foreach part [Objects $page NewPartInstsIter NextPartInst delete_DboPagePartInstsIter] {
+            set placed 13
+            if {[info exists ::DboBaseObject_PLACED_INSTANCE]} {set placed $::DboBaseObject_PLACED_INSTANCE}
+            if {[DboBaseObject_GetObjectType $part]!=$placed} {incr stats(skipped); continue}
+            # Effective Reference first, matching current quick-tool behavior.
+            set reference [::PageReferenceFix::GetReference $part]
+            if {$reference eq ""} {error "A part on $pageName has no readable reference; export stopped."}
+            lappend parts [list $reference $part]
+        }
+        foreach partRecord [lsort -dictionary -index 0 $parts] {
+            foreach {reference part} $partRecord break
+            if {[catch {String $part GetPartValue} value]} {error "$pageName / $reference: $value"}
+            incr stats(parts)
+            if {[catch {Objects $part NewPinsIter NextPin delete_DboPartInstPinsIter} pins]} {error "$pageName / $reference: $pins"}
+            if {![llength $pins]} {incr stats(noPins)}
+            foreach pin $pins {
+                set number [String $pin GetPinNumber]
+                if {$number eq ""} {error "$pageName / $reference contains a pin with no readable number; export stopped."}
+                set pinName [String $pin GetPinName]
+                if {[catch {NetName $pin} net]} {error "$pageName / $reference, pin $number: $net"}
+                set connection Connected
+                if {$net eq ""} {set connection Unconnected}
+                # The optional eighth field prevents distinct placed units with
+                # duplicate refs/value from being accidentally merged by XLSX.
+                lappend rows [list $pageName $reference $value $number $pinName $net $connection [list $page $part]]
+                incr stats(pins)
+            }
+        }
+        puts "All-design pin-net export: pages=$stats(pages), placed-units=$stats(parts), pins=$stats(pins)"
+    }
+    return $rows
+}
+proc ::DesignPinNetExport::ChooseFile {design} {
+    set directory [pwd]; set base Design
+    if {![catch {String $design GetName} name] && $name ne ""} {
+        if {[file isdirectory [file dirname $name]]} {set directory [file dirname $name]}
+        set base [file rootname [file tail $name]]
+    }
+    set initial "${base}_All_Part_Pin_Net_[clock format [clock seconds] -format %Y%m%d_%H%M%S].xlsx"
+    package require Tk
+    return [tk_getSaveFile -title "Export All Design Parts Pin-Net Table" -initialdir $directory -initialfile $initial \
+        -defaultextension .xlsx -filetypes [list [list {Excel Workbook} .xlsx] [list {All Files} *]]]
+}
+proc ::DesignPinNetExport::Run {args} {
+    variable Busy
+    if {$Busy} {return}
+    set Busy 1; set output ""
+    set code [catch {
+        set design [Design]
+        if {[Null $design]} {error "Select a design (.dsn) or open a schematic page first."}
+        set output [ChooseFile $design]
+        if {$output ne ""} {
+            if {![string equal -nocase [file extension $output] .xlsx]} {append output .xlsx}
+            puts "All-design pin-net export: reading every schematic page of the current DSN; no design changes."
+            set rows [Collect $design stats]
+            if {![llength $rows]} {error "No component pins found in this design. No workbook was written."}
+            ::OrCADPinNetXlsx::WriteWorkbook $output $rows "All Design Parts Pin-Net Table"
+        }
+    } message]
+    set Busy 0
+    if {$code} {
+        puts "All-design pin-net export FAILED: $message"
+        catch {tk_messageBox -type ok -icon error -title "All Design Pin-Net Export" -message $message}
+    } elseif {$output eq ""} {
+        puts "All-design pin-net export: cancelled."
+    } else {
+        puts "All-design pin-net export complete: pages=$stats(pages), placed-units=$stats(parts), pins=$stats(pins), zero-pin-units=$stats(noPins), file=$output"
+        catch {tk_messageBox -type ok -icon info -title "All Design Pin-Net Export" \
+            -message "Export complete.\n\nPages: $stats(pages)\nPlaced units: $stats(parts)\nPins: $stats(pins)\nUnits with no pins (no pin rows): $stats(noPins)\nFile: $output"}
+    }
+}
+# END MODULE: 06 ALL-DESIGN PIN-NET EXPORT
+
+# ============================================================================
+# 07 INITIALIZATION - keep this after ALL module definitions.
 # ============================================================================
 ::OrCADQuickTools::Initialize

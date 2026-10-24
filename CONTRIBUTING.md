@@ -14,6 +14,9 @@
 
 - `test_page_auto_annotate.tcl`：页码、位号、中文帮助与菜单。
 - `test_offpage_toggle.tcl`：跨页符号替换及失败恢复，首次与连续快捷操作无说明弹窗，真实失败仍有错误提示。
+- `test_offpage_session.tcl`：会话包装、库查找与替换前预检失败保护。
+- `test_part_preview.tcl`：原生点击事件、通用自定义字段、去重、开关及资源释放。
+- `test_design_pin_net.tcl`：全设计页面/器件/引脚、未连接状态、自然排序和读取失败保护。
 - `test_wheel_zoom.tcl`：鼠标组件启动、回执、心跳、偏好与关闭，成功开关不弹说明，启动失败仍提示。
 - `test_signals_navigation.tcl`：单选导线、延后启动、启动前换页/改选取消、结果回执、错误日志、禁止重复分派 14844，以及只有后台启动返回后才发布握手标记。不能将模拟请求的 A/B 网络变化当作原生 Signals 面板刷新已验证；原生验证须另行观察真实列表及 Capture 查找日志，0.17 的本机实测记录见 CHANGELOG。
 - `test_wheel_zoom_native.ps1`：分别编译并运行 x86/x64 鼠标导航策略、消息编码和结构布局测试。
@@ -21,7 +24,7 @@
 
 Tcl 测试建议使用 Capture 安装附带的 Tcl 8.4 解释器，在源码目录运行；不要在正在编辑真实设计的 Capture 中执行 mock 测试。测试脚本不可放进 `capAutoLoad`。
 
-开发优先修改 `src` 下的四个 Tcl 模块，再运行 `build_tcl_bundle.ps1` 生成根目录合并入口。新增功能按 `EXTENDING.md` 在共享配置中登记，不重复编写注册、帮助和菜单。直接修改生成文件后须同步回源模块，否则下次构建会覆盖修改。
+开发优先修改 `src` 下的六个 Tcl 模块，再运行 `build_tcl_bundle.ps1` 生成根目录合并入口。新增功能按 `EXTENDING.md` 在共享配置中登记，不重复编写注册、帮助和菜单。直接修改生成文件后须同步回源模块，否则下次构建会覆盖修改。
 
 `build_wheel_zoom.ps1` 编译鼠标辅助程序；`package_release.ps1` 生成双文件安装 ZIP 和含说明/源码的开发分享包。仅 `OrCADQuickTools.tcl` 与 `OrCADWheelZoom.exe` 用于安装。默认复用已有 EXE，修改 C# 后先编译或加 `-RebuildMouseHelper`。输出在 `dist`，不覆盖旧分享包，不自动发布 GitHub。
 

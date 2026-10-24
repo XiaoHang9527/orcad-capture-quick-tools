@@ -35,6 +35,7 @@ proc ::SignalsNavigation::StartContext {resultFile} {
     lappend ::calls [list context [lindex $::selection 0]]
     if {$::refreshFailure} {error "native context helper unavailable"}
     if {$::refreshChanges} {set ::selection wireB}
+    file mkdir [file dirname $resultFile]
     set f [open $resultFile w]; puts -nonewline $f $::contextResult; close $f
 }
 proc settle {} {after 90 {set ::settled 1}; vwait ::settled}
@@ -134,7 +135,7 @@ set ::contextResult {}; set ::calls {}; set ::notices {}
 update idletasks
 set callback [lindex [after info $::SignalsNavigation::Pending] 0]
 after cancel $::SignalsNavigation::Pending
-::SignalsNavigation::PollContext [lindex $callback 1] [lindex $callback 2] 110
+::SignalsNavigation::PollContext [lindex $callback 1] [lindex $callback 2] 275
 assert {$::calls eq {{context wireA}} && [llength $::notices]==1 && !$::SignalsNavigation::Busy && $::SignalsNavigation::Pending eq ""} "Timed out helper dispatched Signals or leaked busy state"
 set ::contextResult context-ready; set ::calls {}; set ::notices {}
 ::SignalsNavigation::Run
@@ -161,21 +162,49 @@ assert {[string first {no action retry} [join $::logs]] >= 0} "Residual menu cle
 set ::contextResult signals-invoked
 puts "PASS: Signals invoked with residual menu is acknowledged once; cleanup warning distinct from action failure"
 
-# Inspect the real launcher with a mocked exec: no child/UI actions. The ready
-# marker MUST be absent while exec runs and published only after its return.
+# The real poller must cancel a queued resident request on selection changes,
+# and retain cancellation on timeout so delayed COM work cannot act afterward.
+set ::contextResult {}; set ::calls {}; set ::notices {}; set ::selection wireA
+::SignalsNavigation::Run
+update idletasks
+set callback [lindex [after info $::SignalsNavigation::Pending] 0]
+set cancelledResult [lindex $callback 2]
+set ::selection wireB
+after cancel $::SignalsNavigation::Pending
+::SignalsNavigation::PollContext [lindex $callback 1] $cancelledResult 0
+assert {[file exists "$cancelledResult.cancel"]} "Selection change did not cancel resident request"
+after cancel $::SignalsNavigation::Pending
+::SignalsNavigation::PollContext [lindex $callback 1] $cancelledResult 275
+assert {[file exists "$cancelledResult.cancel"] && !$::SignalsNavigation::Busy} "Timeout did not retain cancellation or release busy state"
+file delete "$cancelledResult.cancel"
+set ::contextResult signals-invoked; set ::selection wireA
+puts "PASS: changed selection and timeout publish cancellation; no automatic process/action retry"
+
+# Inspect the real launcher with mocked exec: no child/UI actions. Atomic request
+# publication MUST follow exec return; a warm request must not call exec again.
 set ::OrCADQuickTools::ScriptDirectory [pwd]
-set launchResult [file join [pwd] signals-launch-[pid]-[clock clicks].result]
+set ::SignalsNavigation::ServerDirectory [file join $::env(TEMP) OrCADSignalsServer-[pid]-test-[clock clicks]]
+set ::SignalsNavigation::ServerStarted 0
+set launchResult [file join $::SignalsNavigation::ServerDirectory request-101.result]
+set ::launchCount 0
 rename exec ::savedExec
 proc exec {args} {
+    incr ::launchCount
     set ::launchArguments $args
-    assert {![file exists "$::launchResult.ready"]} "Ready marker published before exec returned"
+    assert {![file exists "$::launchResult.request"]} "Request published before exec returned"
     return 12345
 }
 ::SignalsNavigation::OriginalStartContext $launchResult
+set f [open "$launchResult.request" r]; set marker [read $f]; close $f
+assert {$marker eq "capture-ready-v21"} "Wrong resident launch protocol"
+assert {[lindex $::launchArguments 1] eq "--signals-server"} "Reusable helper not launched"
+set secondResult [file join $::SignalsNavigation::ServerDirectory request-102.result]
+::SignalsNavigation::OriginalStartContext $secondResult
+assert {$::launchCount==1 && [file exists "$secondResult.request"]} "Warm request launched another process"
+assert {![file exists "$secondResult.request-writing"]} "Partial request exposed"
 rename exec {}
 rename ::savedExec exec
-set f [open "$launchResult.ready" r]; set marker [read $f]; close $f
-assert {$marker eq "capture-ready-v17"} "Wrong launch protocol"
 assert {[lrange $::launchArguments end-4 end] eq {< NUL >& NUL &}} "Helper did not detach standard handles"
-file delete "$launchResult.ready"
-puts "PASS: GUI launch readiness published only after background exec returns; standard handles detached"
+file delete "$launchResult.request" "$secondResult.request"
+file delete $::SignalsNavigation::ServerDirectory
+puts "PASS: reusable helper starts once; cold/warm requests published atomically after launcher return; standard handles detached"

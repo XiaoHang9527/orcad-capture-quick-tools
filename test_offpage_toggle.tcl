@@ -1,4 +1,8 @@
 # Pure Tcl 8.4 API mock. This does NOT validate Capture's native C++ behavior.
+set ::offpageSavedTemp $::env(TEMP)
+set ::offpageTestTemp [file join $::env(TEMP) OrCADOffPageTest-[pid]-[clock clicks]]
+file mkdir $::offpageTestTemp
+set ::env(TEMP) $::offpageTestTemp
 source [file join [file dirname [info script]] src OrCADOffPageToggle.tcl]
 proc assert {value message} {if {!$value} {error $message}}
 set ::statusSerial 0
@@ -421,3 +425,8 @@ assert [expr {[llength $::messages]==1 && $::writes==0 && !$::OffPageDirection::
 set errorDialog [lindex $::messages 0]
 assert [expr {[lindex $errorDialog [expr {[lsearch -exact $errorDialog -icon]+1}]] eq "error"}] "Failure dialog is not an error"
 puts "PASS: first/repeated Alt+F5 execute silently; names and geometry verified; actual error popup retained"
+set ::env(TEMP) $::offpageSavedTemp
+if {[file exists [file join $::offpageTestTemp OrCADOffPageToggle.log]]} {
+    file delete [file join $::offpageTestTemp OrCADOffPageToggle.log]
+}
+file delete $::offpageTestTemp

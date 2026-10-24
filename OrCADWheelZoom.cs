@@ -25,7 +25,7 @@ internal static class OrCADWheelZoom
     static Process capture;
     static EventWaitHandle stop;
     static int wheelCount;
-    const string Version = "wheel-0.20-signals-key-independent";
+    const string Version = "wheel-0.21-signals-reusable";
     static readonly PanGesture pan = new PanGesture();
     static IntPtr panView;
     static IntPtr panForeground;
@@ -1162,12 +1162,13 @@ internal static class OrCADWheelZoom
             GetAncestor(window, 3) == GetAncestor(foreground, 3), thread != 0 && thread == viewThread);
     }
 
-    static List<IntPtr> CaptureVisibleWindows(IntPtr foreground, IntPtr view)
+    static List<IntPtr> CaptureVisibleWindows(IntPtr foreground, IntPtr view, bool includeChildren = true)
     {
         var windows = new List<IntPtr>();
         EnumWindows(delegate(IntPtr window, IntPtr unused) {
             if (!SignalsPopupInScope(window, foreground, view)) return true;
             windows.Add(window);
+            if (!includeChildren) return true;
             EnumChildWindows(window, delegate(IntPtr child, IntPtr arg) {
                 uint childPid; GetWindowThreadProcessId(child, out childPid);
                 if (childPid == capturePid && IsWindowVisible(child)) windows.Add(child);
@@ -1207,13 +1208,26 @@ internal static class OrCADWheelZoom
         catch (COMException) {} catch (InvalidCastException) {} catch (FormatException) {}
     }
 
+    // Cache the successful object category, NEVER an HWND, network or COM item.
+    static readonly Dictionary<string, uint> signalsObjectKinds = new Dictionary<string, uint>();
+    internal static uint[] SignalsObjectOrder(uint preferred)
+    {
+        var order = new List<uint>();
+        foreach (uint id in new uint[] {preferred, unchecked((uint)-4), unchecked((uint)-3), 0})
+            if ((id == unchecked((uint)-4) || id == unchecked((uint)-3) || id == 0) && !order.Contains(id)) order.Add(id);
+        return order.ToArray();
+    }
+    internal static int SignalsLookupPause(long elapsed) { return elapsed < 150 ? 10 : 30; }
+
     static SignalsAccessibleItem FindSignalsAccessible(List<IntPtr> candidates, Stopwatch request)
     {
         var guid = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");
         foreach (IntPtr window in candidates) {
             if (request.ElapsedMilliseconds > 3000) break;
-            // CLIENT for custom MFC, MENU for standard popup, then WINDOW root.
-            foreach (uint objectId in new uint[] {unchecked((uint)-4), unchecked((uint)-3), 0}) {
+            string windowClass = ClassOf(window);
+            uint preferred;
+            if (!signalsObjectKinds.TryGetValue(windowClass, out preferred)) preferred = unchecked((uint)-4);
+            foreach (uint objectId in SignalsObjectOrder(preferred)) {
                 IAccessible accessible;
                 try {
                     if (AccessibleObjectFromWindow(window, objectId, ref guid, out accessible) < 0 || accessible == null) continue;
@@ -1221,19 +1235,24 @@ internal static class OrCADWheelZoom
                 var matches = new List<SignalsAccessibleItem>(); int budget = 384;
                 ScanSignalsAccessible(accessible, 0, window, matches, 0, ref budget, request);
                 if (matches.Count > 1) throw new InvalidOperationException("Ambiguous Signals items; nothing invoked");
-                if (matches.Count == 1) return matches[0];
+                if (matches.Count == 1) {
+                    if (signalsObjectKinds.Count < 32 || signalsObjectKinds.ContainsKey(windowClass))
+                        signalsObjectKinds[windowClass] = objectId;
+                    return matches[0];
+                }
             }
         }
         return null;
     }
 
-    static int PrepareSignalsContext(string resultPath)
+    static int PrepareSignalsContext(string resultPath, Func<bool> requestValid = null)
     {
         logPath = Path.Combine(Path.GetTempPath(), "OrCADSignalsNavigation-native.log");
         IntPtr foreground = IntPtr.Zero, view = IntPtr.Zero;
         var discovered = new HashSet<IntPtr>();
         bool invoked = false;
         SignalsGestureObserver input = null;
+        var total = Stopwatch.StartNew();
         try {
             Log("Signals request started: " + Version + "; Capture pid=" + capturePid);
             using (var target = Process.GetProcessById(capturePid)) {
@@ -1258,9 +1277,11 @@ internal static class OrCADWheelZoom
             int openingCheckpoint = input.State.Generation;
             Log("Signals gesture observer ready=" + input.Ready);
             uint inserted, cleanup;
+            if (requestValid != null && !requestValid()) throw new InvalidOperationException("Signals request expired or cancelled before popup");
             if (!ReplayRightClick(delegate(NativeInput[] inputs) {
                 return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(NativeInput)));
             }, out inserted, out cleanup)) throw new InvalidOperationException("Native right click failed: " + inserted);
+            Log("Timing: before-popup=" + total.ElapsedMilliseconds + " ms");
             wait.Restart(); SignalsAccessibleItem item = null;
             while (wait.ElapsedMilliseconds < 3000) {
                 POINT current;
@@ -1269,13 +1290,28 @@ internal static class OrCADWheelZoom
                     throw new InvalidOperationException("Pointer or active window changed during Signals request");
                 if (GetAsyncKeyState(0x1B) < 0) throw new InvalidOperationException("Signals request cancelled by Escape");
                 var candidates = new List<IntPtr>();
-                foreach (IntPtr window in CaptureVisibleWindows(foreground, view)) if (!baseline.Contains(window)) {
+                // Most Capture popups are top-level: avoid enumerating the entire
+                // drawing tree while the menu flashes. Retain the full fallback
+                // for versions exposing their custom popup as a child window.
+                foreach (IntPtr window in CaptureVisibleWindows(foreground, view, false)) if (!baseline.Contains(window)) {
                     candidates.Add(window);
                     if (discovered.Add(window)) Log("New context window=" + window.ToInt64().ToString("X") + " class=" + ClassOf(window));
                 }
                 item = FindSignalsAccessible(candidates, wait);
                 if (item != null) break;
-                Thread.Sleep(30);
+                {
+                    var triedTopLevel = new HashSet<IntPtr>(candidates);
+                    candidates.Clear();
+                    foreach (IntPtr window in CaptureVisibleWindows(foreground, view))
+                        if (!baseline.Contains(window) && !triedTopLevel.Contains(window)) {
+                            candidates.Add(window);
+                            if (discovered.Add(window)) Log("New fallback context window=" + window.ToInt64().ToString("X") + " class=" + ClassOf(window));
+                        }
+                    item = FindSignalsAccessible(candidates, wait);
+                    if (item != null) break;
+                }
+                if (requestValid != null && !requestValid()) throw new InvalidOperationException("Signals request expired or cancelled during lookup");
+                Thread.Sleep(SignalsLookupPause(wait.ElapsedMilliseconds));
             }
             if (item == null) throw new InvalidOperationException("No accessible enabled Signals menu item; new windows=" + discovered.Count);
             POINT finalPoint;
@@ -1293,13 +1329,20 @@ internal static class OrCADWheelZoom
                 throw new InvalidOperationException("Signals request expired or cancelled during menu readback");
             if (input.Ready && !input.State.Unchanged(openingCheckpoint))
                 throw new InvalidOperationException("New mouse/key gesture cancelled Signals request");
+            if (requestValid != null && !requestValid()) throw new InvalidOperationException("Signals request expired or cancelled before action");
             // An uncertain action is never retried with 14844; it may have run.
             SignalsPopupTicket popupTicket = CaptureSignalsPopup(item, baseline, foreground, view, input);
+            if ((requestValid != null && !requestValid()) || GetForegroundWindow() != foreground
+                || GetAsyncKeyState(0x1B) < 0 || (input.Ready && !input.State.Unchanged(openingCheckpoint)))
+                throw new InvalidOperationException("Signals request cancelled during popup identity check");
             Log("Invoking accessible Signals menu action: window=" + item.Window.ToInt64().ToString("X") + " class=" + ClassOf(item.Window));
+            Log("Timing: menu-lookup=" + wait.ElapsedMilliseconds + " ms; before-action=" + total.ElapsedMilliseconds + " ms");
             invoked = true;
             item.Parent.accDoDefaultAction(item.Child);
             Log("Signals menu action returned; native pane result not verified");
+            Log("Timing: action-return=" + total.ElapsedMilliseconds + " ms");
             SignalsCleanupResult cleanupResult = CompleteSignalsPopup(popupTicket, foreground, view);
+            Log("Timing: helper-total=" + total.ElapsedMilliseconds + " ms");
             WriteSignalsResult(resultPath, cleanupResult == SignalsCleanupResult.StillOpen
                 ? "signals-invoked-menu-open" : "signals-invoked"); return 0;
         } catch (Exception ex) {
@@ -1314,6 +1357,127 @@ internal static class OrCADWheelZoom
                     PostMessage(window, 0x001F, IntPtr.Zero, IntPtr.Zero);
             }
             if (input != null) input.Dispose();
+        }
+    }
+
+    // Small negative ages can result from filesystem/system-clock granularity.
+    // A large future timestamp must never create an indefinitely live request.
+    internal static bool SignalsRequestFresh(double ageMs) { return ageMs >= -100 && ageMs <= 3000; }
+    internal static bool SignalsRequestName(string name)
+    {
+        const string suffix = ".result.request";
+        if (!name.StartsWith("request-", StringComparison.Ordinal) || !name.EndsWith(suffix, StringComparison.Ordinal)) return false;
+        string token = name.Substring(8, name.Length-8-suffix.Length);
+        if (token.Length == 0 || token.Length > 64) return false;
+        foreach (char c in token) if ((c < '0' || c > '9') && c != '-') return false;
+        return true;
+    }
+
+    // FileSystemWatcher notifications can duplicate or arrive before/after a
+    // rescan. Claim by rename; only the claimant may perform one native action.
+    // Payload is a fixed marker, not a command or an arbitrary output path.
+    internal sealed class SignalsMailbox
+    {
+        readonly string root;
+        readonly Func<string, Func<bool>, int> execute;
+        internal SignalsMailbox(string directory, Func<string, Func<bool>, int> action)
+        { root = directory; execute = action; }
+
+        internal void Drain()
+        {
+            foreach (string request in Directory.GetFiles(root, "*.request")) {
+                if (!SignalsRequestName(Path.GetFileName(request))) continue;
+                string working = request + ".working";
+                string result = request.Substring(0, request.Length-8);
+                try { File.Move(request, working); } catch (IOException) { continue; }
+                try {
+                    Func<bool> valid = delegate {
+                        return File.Exists(working) && !File.Exists(result + ".cancel")
+                            && SignalsRequestFresh((DateTime.UtcNow-File.GetLastWriteTimeUtc(working)).TotalMilliseconds);
+                    };
+                    if (File.Exists(result) || File.Exists(result + ".writing")) continue;
+                    var info = new FileInfo(working);
+                    if (info.Length != "capture-ready-v21".Length || File.ReadAllText(working) != "capture-ready-v21") {
+                        WriteSignalsResult(result, "error: Invalid Signals request protocol"); continue;
+                    }
+                    if (!valid()) {
+                        WriteSignalsResult(result, "error: Signals request expired or cancelled; nothing invoked"); continue;
+                    }
+                    execute(result, valid);
+                } catch (Exception ex) {
+                    Log("Signals mailbox error: " + ex.Message);
+                    if (!File.Exists(result)) try { WriteSignalsResult(result, "error: " + ex.Message); } catch {}
+                } finally {
+                    try { File.Delete(working); File.Delete(result + ".cancel"); } catch {}
+                }
+            }
+        }
+    }
+
+    internal static bool SignalsServerRootAllowed(string root, int pid)
+    {
+        var directory = new DirectoryInfo(Path.GetFullPath(root));
+        string temp = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar);
+        return directory.Parent != null && directory.Parent.FullName.TrimEnd(Path.DirectorySeparatorChar).Equals(temp, StringComparison.OrdinalIgnoreCase)
+            && directory.Name.StartsWith("OrCADSignalsServer-" + pid + "-", StringComparison.Ordinal)
+            && (directory.Attributes & FileAttributes.ReparsePoint) == 0;
+    }
+
+    // Separate from wheel/pan: disabling mouse navigation must not disable
+    // Signals, and menu COM calls must not delay the navigation hook thread.
+    static int RunSignalsServer(string root)
+    {
+        if (!Directory.Exists(root) || !SignalsServerRootAllowed(root, capturePid)) return 2;
+        logPath = Path.Combine(Path.GetTempPath(), "OrCADSignalsNavigation-native.log");
+        bool created;
+        using (var mutex = new Mutex(true, "Local\\OrCADQuickToolsSignals_" + capturePid, out created)) {
+            if (!created) return 1; // never run a second server for this Capture
+            try {
+                using (var target = Process.GetProcessById(capturePid)) {
+                    if (!target.ProcessName.Equals("Capture", StringComparison.OrdinalIgnoreCase)) return 2;
+                    ConfigureDpi();
+                    return RunSignalsMailboxLoop(root, delegate {return !target.HasExited;}, PrepareSignalsContext);
+                }
+            } catch (Exception ex) { Log("Signals server failed: " + ex.Message); return 1; }
+        }
+    }
+
+    // Exposed internally for a no-input lifecycle test with a fake action.
+    internal static int RunSignalsMailboxLoop(string root, Func<bool> alive, Func<string, Func<bool>, int> action)
+    {
+        using (var context = new ApplicationContext())
+        using (var dispatcher = new Control())
+        using (var watcher = new FileSystemWatcher(root, "*.request"))
+        using (var timer = new System.Windows.Forms.Timer()) {
+            IntPtr handle = dispatcher.Handle; // creates queue/input-idle, no visible form
+            int queued = 0;
+            var mailbox = new SignalsMailbox(root, action);
+            Action drain = delegate {
+                Interlocked.Exchange(ref queued, 0);
+                try { if (!alive()) { context.ExitThread(); return; } }
+                catch (Exception ex) { Log("Signals lifetime check failed: " + ex.Message); context.ExitThread(); return; }
+                try { mailbox.Drain(); } catch (Exception ex) { Log("Signals inbox read failed: " + ex.Message); }
+            };
+            Action wake = delegate {
+                if (Interlocked.Exchange(ref queued, 1) != 0) return;
+                try { dispatcher.BeginInvoke(drain); }
+                catch (InvalidOperationException) { Interlocked.Exchange(ref queued, 0); }
+            };
+            watcher.NotifyFilter = NotifyFilters.FileName;
+            watcher.Created += delegate {wake();};
+            watcher.Renamed += delegate {wake();};
+            watcher.Error += delegate {wake();};
+            watcher.EnableRaisingEvents = true;
+            // File events trigger normal requests immediately; a low-frequency
+            // rescan handles missed notifications and watches Capture lifetime.
+            timer.Interval = 1000;
+            timer.Tick += delegate {drain();};
+            timer.Start();
+            Log("Reusable Signals server started: " + Version + "; Capture pid=" + capturePid);
+            wake(); // catch requests published during process startup
+            Application.Run(context);
+            Log("Reusable Signals server stopped");
+            return 0;
         }
     }
 
@@ -1359,6 +1523,7 @@ internal static class OrCADWheelZoom
     {
         if (args.Length < 2 || !Int32.TryParse(args[1], out capturePid)) return 2;
         if (args[0] == "--signals-context" && args.Length == 3) return RunSignalsContext(Path.GetFullPath(args[2]));
+        if (args[0] == "--signals-server" && args.Length == 3) return RunSignalsServer(Path.GetFullPath(args[2]));
         string name = "Local\\OrCADQuickToolsWheel_" + capturePid;
         if (args[0] == "--stop")
         {

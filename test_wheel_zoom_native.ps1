@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([switch]$SignalsGuardSmoke)
+param([switch]$SignalsGuardSmoke, [switch]$SignalsServerSmoke)
 $ErrorActionPreference = 'Stop'
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
 $testDir = Join-Path $env:TEMP ('OrCADWheelNativeTests-' + [guid]::NewGuid().ToString('N'))
@@ -13,5 +13,9 @@ foreach ($platform in @('x86','x64')) {
     if ($SignalsGuardSmoke) {
         & $testExe --signals-guard-smoke
         if ($LASTEXITCODE -ne 0) {throw "Signals observer lifecycle tests failed: $platform"}
+    }
+    if ($SignalsServerSmoke) {
+        & $testExe --signals-server-smoke
+        if ($LASTEXITCODE -ne 0) {throw "Signals reusable server tests failed: $platform"}
     }
 }
