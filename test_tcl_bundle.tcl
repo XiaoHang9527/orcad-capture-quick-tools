@@ -7,7 +7,17 @@ proc AddAccessoryMenu args {lappend ::menus $args}
 if {[info exists ::env(ORCAD_BUNDLE_TEST_ENTRY)]} {
     set entry $::env(ORCAD_BUNDLE_TEST_ENTRY)
 } else {set entry [file join [file dirname [info script]] OrCADQuickTools.tcl]}
-set output $::env(ORCAD_BUNDLE_TEST_XLSX)
+set output ""
+if {[info exists ::env(ORCAD_BUNDLE_TEST_XLSX)]} {set output $::env(ORCAD_BUNDLE_TEST_XLSX)}
+array set savedTemp {}
+foreach name {TMP TEMP USERPROFILE LOCALAPPDATA} {
+    if {[info exists ::env($name)]} {set savedTemp($name) $::env($name); unset ::env($name)}
+}
+source $entry
+puts "Tcl [info patchlevel]; zlib=[expr {[llength [info commands ::zlib]] > 0}]"
+assert {$::SignalsNavigation::ServerDirectory eq ""} "Signals selected an unverified fallback directory"
+foreach name [array names savedTemp] {set ::env($name) $savedTemp($name)}
+unset ::SignalsNavigation::ServerDirectory
 source $entry
 assert {[string first "\u53F3\u952E\u5355\u51FB\uFF1A\u4ECD\u663E\u793A\u539F\u6709\u83DC\u5355" [::QuickToolsHelp::ShortcutText]] < 0} "Native right-click description must not appear in help"
 assert {[string first "Alt+S\uFF1A\u5355\u9009\u4E00\u6839\u5BFC\u7EBF" [::QuickToolsHelp::ShortcutText]] < 0} "Supplemental Signals usage must not appear in help"
@@ -86,12 +96,40 @@ rename ::OrCADWheel::TestOriginalAutoStart ::OrCADWheel::AutoStart
 rename IsSchematicViewActive {}
 
 # Actual export from the single entry, with numeric pin ordering and escaping.
+foreach {data expected} {{} 00000000 a E8B7BE43 123456789 CBF43926 {The quick brown fox jumps over the lazy dog} 414FA339} {
+    assert {[format %08X [::OrCADPinNetXlsx::CRC32 $data]] eq $expected} "CRC regression for $data"
+}
+set longBytes [encoding convertto utf-8 [string repeat "OrCAD\u6D4B\u8BD5" 7000]]
+assert {[format %08X [::OrCADPinNetXlsx::CRC32 $longBytes]] eq "126F9BD5"} "Multiblock CRC did not match reference"
+assert {[string first {_x005F_x0041_} [::OrCADPinNetXlsx::InlineCell A1 _x0041_ 0]] >= 0} "Literal SpreadsheetML escape changed"
+assert {[catch {::OrCADPinNetXlsx::InlineCell A1 [string repeat A 32768] 0}]} "Oversized cell was accepted"
 set controlText "A[binary format c 0][binary format c 8][binary format c 11][binary format c 12][binary format c 14][binary format c 31]B"
 assert {[::OrCADPinNetXlsx::XmlEscape $controlText] eq "AB"} "Normalized control-character regex changed behavior"
 set rows [list \
     [list "P03. \u6D4B\u8BD5" U301 "=SUM(1,2)" 10 OUT "NET<&>" Connected] \
     [list "P03. \u6D4B\u8BD5" U301 "=SUM(1,2)" 2 IN "NET2" Connected] \
     [list "P03. \u6D4B\u8BD5" U301 "=SUM(1,2)" 1 GND "" Unconnected]]
-::OrCADPinNetXlsx::WriteWorkbook $output $rows
-assert {[file exists $output] && [file size $output] > 0} "Merged XLSX writer failed"
+set standalone [expr {$output eq ""}]
+if {$standalone} {
+    set output [::OrCADQuickTools::TempPath OrCADBundleTest-[pid]-[clock clicks].xlsx]
+    assert {$output ne ""} "Provide ORCAD_BUNDLE_TEST_XLSX or a writable temporary directory"
+}
+set writeCode [catch {
+    ::OrCADPinNetXlsx::WriteWorkbook $output $rows {Test _x0041_ title}
+    assert {[file exists $output] && [file size $output] > 0} "Merged XLSX writer failed"
+} writeError]
+if {$standalone} {catch {file delete -- $output}}
+if {$writeCode} {error $writeError}
 puts "PASS: two-file loading, twelve shortcuts, menu/help registry, safe extensions, reload state and XLSX creation"
+
+# Exercise the actual packaged EXE and pipe protocol against this Tcl PID.
+# It is not Capture and no input hook or design is involved.
+rename ::OrCADWheel::StopFinished ::OrCADWheel::TestSavedStopFinished
+proc ::OrCADWheel::StopFinished {failed message} {set ::stopResult [list $failed $message]}
+set ::OrCADWheel::StateFile ""
+::OrCADWheel::RequestStop
+set timeout [after 5000 {set ::stopResult {1 {Stop worker timed out}}}]
+vwait ::stopResult
+after cancel $timeout
+assert {![lindex $::stopResult 0]} "Packaged helper shutdown check failed: $::stopResult"
+puts "PASS: packaged helper acknowledged asynchronous stop"

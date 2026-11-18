@@ -1,4 +1,5 @@
 # Standalone Tcl 8.4 mocks. Never load this file into Capture.
+source [file join [file dirname [info script]] src OrCADQuickTools.core.tcl]
 source [file join [file dirname [info script]] src OrCADPartPreview.tcl]
 # A generic test-only field exercises literal slashes and user customization.
 rename ::PartPreview::Fields ::PartPreview::PublicDefaultFields

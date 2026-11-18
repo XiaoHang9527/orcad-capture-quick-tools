@@ -23,48 +23,6 @@ proc ::DesignPinNetExport::Enabler {args} {
     variable Busy
     return [expr {!$Busy && ![catch {Design} design] && ![Null $design]}]
 }
-proc ::DesignPinNetExport::Check {state stage} {
-    if {![$state Succeeded]} {error "$stage failed (Capture status [$state Code]); export stopped, not silently truncated."}
-}
-proc ::DesignPinNetExport::Objects {owner create next destroy args} {
-    set iterator ""; set state ""; set objects {}
-    set code [catch {
-        set state [DboState]
-        set iterator [eval [linsert $args 0 $owner $create $state]]
-        Check $state $create
-        $state -delete; set state ""
-        if {[Null $iterator]} {error "$create returned no iterator."}
-        array set seen {}
-        while {1} {
-            set state [DboState]
-            set object [$iterator $next $state]
-            set end [expr {[Null $object] && ([$state Succeeded] || [$state Code]==1022)}]
-            if {!$end} {Check $state $next}
-            $state -delete; set state ""
-            if {$end} {break}
-            if {[info exists seen($object)]} {error "$next repeated an object; export stopped."}
-            set seen($object) 1
-            lappend objects $object
-        }
-    } message]
-    if {$state ne ""} {catch {$state -delete}}
-    if {![Null $iterator]} {catch {$destroy $iterator}}
-    if {$code} {error $message}
-    return $objects
-}
-proc ::DesignPinNetExport::String {object method} {
-    set value ""; set status ""
-    set code [catch {
-        set value [DboTclHelper_sMakeCString]
-        set status [$object $method $value]
-        if {![Null $status] && [namespace which -command $status] ne ""} {Check $status $method}
-        set result [DboTclHelper_sGetConstCharPtr $value]
-    } message]
-    if {$value ne "" && [llength [info commands DboTclHelper_sDeleteCString]]} {catch {DboTclHelper_sDeleteCString $value}}
-    if {![Null $status]} {catch {$status -delete}}
-    if {$code} {error "$method: $message"}
-    return $result
-}
 proc ::DesignPinNetExport::NetName {pin} {
     set failures {}
     foreach method {GetNet GetWire} {
@@ -78,11 +36,11 @@ proc ::DesignPinNetExport::NetName {pin} {
                 # absence in GetNet alone does NOT prove disconnection.
                 # Accept these codes only for NULL network/wire lookups,
                 # never for a returned object, iterator or property read.
-                if {![$state Succeeded] && [$state Code]!=1021 && [$state Code]!=1043} {Check $state $method}
+                if {![$state Succeeded] && [$state Code]!=1021 && [$state Code]!=1043} {::QuickToolsDbo::Check $state $method}
                 set name ""
             } else {
-                Check $state $method
-                set name [String $object GetNetName]
+                ::QuickToolsDbo::Check $state $method
+                set name [::QuickToolsDbo::String $object GetNetName]
                 if {$name eq ""} {error "$method returned an unnamed connection"}
             }
         } message]
@@ -92,6 +50,24 @@ proc ::DesignPinNetExport::NetName {pin} {
     if {[llength $failures]} {error "Cannot determine pin network: [join $failures {; }]"}
     return ""
 }
+proc ::DesignPinNetExport::PartRows {page pageName part reference} {
+    set rows {}
+    if {[catch {
+        set value [::QuickToolsDbo::String $part GetPartValue]
+        set pins [::QuickToolsDbo::Objects $part NewPinsIter NextPin delete_DboPartInstPinsIter]
+        foreach pin $pins {
+            set number [::QuickToolsDbo::String $pin GetPinNumber]
+            if {$number eq ""} {error "A pin has no readable number."}
+            set name [::QuickToolsDbo::String $pin GetPinName]
+            if {[catch {NetName $pin} net]} {error "pin $number: $net"}
+            set connection Connected
+            if {$net eq ""} {set connection Unconnected}
+            lappend rows [list $pageName $reference $value $number $name $net $connection [list $page $part]]
+        }
+    } message]} {error "$pageName / $reference: $message"}
+    return $rows
+}
+
 proc ::DesignPinNetExport::Collect {design statsName} {
     upvar 1 $statsName stats
     array set stats {pages 0 parts 0 pins 0 noPins 0 skipped 0}
@@ -102,14 +78,14 @@ proc ::DesignPinNetExport::Collect {design statsName} {
         error "This design reuses hierarchical schematics. A page-instance export would omit occurrence-specific references/nets; flattened occurrence export is not supported yet. No workbook was written."
     }
     set pages {}
-    foreach view [Objects $design NewViewsIter NextView delete_DboLibViewsIter $::IterDefs_SCHEMATICS] {
-        set schematic [DboViewToDboSchematic $view]
-        if {[Null $schematic]} {error "Cannot read a schematic view; export stopped."}
-        set schematicName [String $schematic GetName]
-        foreach page [Objects $schematic NewPagesIter NextPage delete_DboSchematicPagesIter] {
-            set pageName [String $page GetName]
-            lappend pages [list "$schematicName / $pageName" $page]
+    array set schematicNames {}
+    foreach record [::QuickToolsDbo::SchematicPages $design] {
+        foreach {schematic page} $record break
+        if {![info exists schematicNames($schematic)]} {
+            set schematicNames($schematic) [::QuickToolsDbo::String $schematic GetName]
         }
+        set pageName [::QuickToolsDbo::String $page GetName]
+        lappend pages [list "$schematicNames($schematic) / $pageName" $page]
     }
     set rows {}; array set seenPages {}
     foreach pageRecord [lsort -dictionary -index 0 $pages] {
@@ -117,7 +93,7 @@ proc ::DesignPinNetExport::Collect {design statsName} {
         if {[info exists seenPages($page)]} {continue}
         set seenPages($page) 1; incr stats(pages)
         set parts {}
-        foreach part [Objects $page NewPartInstsIter NextPartInst delete_DboPagePartInstsIter] {
+        foreach part [::QuickToolsDbo::Objects $page NewPartInstsIter NextPartInst delete_DboPagePartInstsIter] {
             set placed 13
             if {[info exists ::DboBaseObject_PLACED_INSTANCE]} {set placed $::DboBaseObject_PLACED_INSTANCE}
             if {[DboBaseObject_GetObjectType $part]!=$placed} {incr stats(skipped); continue}
@@ -128,22 +104,11 @@ proc ::DesignPinNetExport::Collect {design statsName} {
         }
         foreach partRecord [lsort -dictionary -index 0 $parts] {
             foreach {reference part} $partRecord break
-            if {[catch {String $part GetPartValue} value]} {error "$pageName / $reference: $value"}
             incr stats(parts)
-            if {[catch {Objects $part NewPinsIter NextPin delete_DboPartInstPinsIter} pins]} {error "$pageName / $reference: $pins"}
-            if {![llength $pins]} {incr stats(noPins)}
-            foreach pin $pins {
-                set number [String $pin GetPinNumber]
-                if {$number eq ""} {error "$pageName / $reference contains a pin with no readable number; export stopped."}
-                set pinName [String $pin GetPinName]
-                if {[catch {NetName $pin} net]} {error "$pageName / $reference, pin $number: $net"}
-                set connection Connected
-                if {$net eq ""} {set connection Unconnected}
-                # The optional eighth field prevents distinct placed units with
-                # duplicate refs/value from being accidentally merged by XLSX.
-                lappend rows [list $pageName $reference $value $number $pinName $net $connection [list $page $part]]
-                incr stats(pins)
-            }
+            set unitRows [PartRows $page $pageName $part $reference]
+            if {![llength $unitRows]} {incr stats(noPins)}
+            incr stats(pins) [llength $unitRows]
+            foreach row $unitRows {lappend rows $row}
         }
         puts "All-design pin-net export: pages=$stats(pages), placed-units=$stats(parts), pins=$stats(pins)"
     }
@@ -151,7 +116,7 @@ proc ::DesignPinNetExport::Collect {design statsName} {
 }
 proc ::DesignPinNetExport::ChooseFile {design} {
     set directory [pwd]; set base Design
-    if {![catch {String $design GetName} name] && $name ne ""} {
+    if {![catch {::QuickToolsDbo::String $design GetName} name] && $name ne ""} {
         if {[file isdirectory [file dirname $name]]} {set directory [file dirname $name]}
         set base [file rootname [file tail $name]]
     }
@@ -183,8 +148,8 @@ proc ::DesignPinNetExport::Run {args} {
     } elseif {$output eq ""} {
         puts "All-design pin-net export: cancelled."
     } else {
-        puts "All-design pin-net export complete: pages=$stats(pages), placed-units=$stats(parts), pins=$stats(pins), zero-pin-units=$stats(noPins), file=$output"
+        puts "All-design pin-net export complete: pages=$stats(pages), placed-units=$stats(parts), pins=$stats(pins), zero-pin-units=$stats(noPins), skipped=$stats(skipped), file=$output"
         catch {tk_messageBox -type ok -icon info -title "All Design Pin-Net Export" \
-            -message "Export complete.\n\nPages: $stats(pages)\nPlaced units: $stats(parts)\nPins: $stats(pins)\nUnits with no pins (no pin rows): $stats(noPins)\nFile: $output"}
+            -message "Export complete.\n\nPages: $stats(pages)\nPlaced units: $stats(parts)\nPins: $stats(pins)\nUnits with no pins (no pin rows): $stats(noPins)\nOther objects skipped: $stats(skipped)\nFile: $output"}
     }
 }

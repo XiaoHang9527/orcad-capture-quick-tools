@@ -1,13 +1,13 @@
 # 最新双文件安装包
 
-当前公开版：**2026.10.24**。本目录仅保留本版，不再提供旧安装 ZIP；Git 提交历史不改写。
+当前版本为 **2026.11.18**。本目录提供本版安装包与校验值。
 
-[下载 OrCADQuickTools-2026.10.24-runtime.zip](OrCADQuickTools-2026.10.24-runtime.zip?raw=true)
+[下载 OrCADQuickTools-2026.11.18-runtime.zip](OrCADQuickTools-2026.11.18-runtime.zip?raw=true)
 
 压缩包内仅有两个文件：
 
 - `OrCADQuickTools.tcl`：12 个快捷键、精简中文帮助、参数预览和全部导出/编辑模块；全设计导出 0.1.2、跨页切换 0.2.5。
-- `OrCADWheelZoom.exe`：滚轮/右键平移及 Signals 辅助，版本 `wheel-0.21-signals-reusable`。
+- `OrCADWheelZoom.exe` 提供滚轮、右键平移及 Signals 辅助，文件版本 `0.23.0.0`。
 
 公开版只配置通用属性，不含组织专用属性名、实际工程、BOM、日志、截图、备份或测试脚本。本机专用配置请另行保管。
 
@@ -28,16 +28,12 @@ puts [info args ::OrCADPinNetXlsx::WriteWorkbook]
 
 ## SHA-256
 
-| 文件 | SHA-256 |
-| --- | --- |
-| OrCADQuickTools-2026.10.24-runtime.zip | `467f4c358085b3c0e57f5253d99e8f6fb83042271c21eb6a88be50f87725728b` |
-| OrCADQuickTools.tcl（解压后） | `af453302d7b7ca250ad6719ee943768de5528a51780ff90034542367d248ae2b` |
-| OrCADWheelZoom.exe（解压后） | `b6b57b7e48ec12866e0c56927d5f9605edef8d895ab8a6660534720c94933d29` |
+打包脚本自动生成 [安装 ZIP 校验值](OrCADQuickTools-2026.11.18-runtime.zip.sha256) 和 [解压后两个文件的校验值](OrCADQuickTools-2026.11.18-files.sha256)。
 
 ## 验证范围
 
-Tcl 8.4 各模块模拟、双文件加载与 XLSX 包结构测试通过；x86/x64 各 463 项策略/ABI 检查、各 9 项只读监听生命周期检查及 Signals 复用服务动作替身测试通过。这些测试不向 Capture 发送命令，不等于所有软件版本实机验证。
+Tcl 8.4.15 与 8.6.5 均通过模块模拟、双文件加载和 XLSX 结构测试。x86/x64 均通过辅助程序策略、ABI、Signals 监听及服务生命周期测试。Roslyn 两次编译的辅助程序 SHA-256 一致。
 
-主要开发环境为 16.6。旧版 0.20 的 Signals 曾由用户确认在 17.4、Ctrl+F2 下可用；0.21 提速效果、全设计大工程及新导出快捷键的十字光标行为仍需实测，不承诺无菜单闪现或固定响应速度。
+Capture 实机仍需在工程副本中验证未编号器件、自定义位号后缀和跨页字体。
 
 更多内容见 [README](../README.md)、[中文速查](../快捷操作速查.md)、[更新记录](../CHANGELOG.md)。

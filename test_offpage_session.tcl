@@ -1,4 +1,5 @@
 # Isolated Tcl 8.4 test, never load into Capture. No native design operations.
+source [file join [file dirname [info script]] src OrCADQuickTools.core.tcl]
 source [file join [file dirname [info script]] src OrCADOffPageToggle.tcl]
 proc assert {condition message} {if {![uplevel 1 [list expr $condition]]} {error $message}}
 set ::OffPageDirection::LogFile ""

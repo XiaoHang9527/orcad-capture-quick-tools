@@ -28,5 +28,9 @@ Tcl 测试建议使用 Capture 安装附带的 Tcl 8.4 解释器，在源码目�
 
 `build_wheel_zoom.ps1` 编译鼠标辅助程序；`package_release.ps1` 生成双文件安装 ZIP 和含说明/源码的开发分享包。仅 `OrCADQuickTools.tcl` 与 `OrCADWheelZoom.exe` 用于安装。默认复用已有 EXE，修改 C# 后先编译或加 `-RebuildMouseHelper`。输出在 `dist`，不覆盖旧分享包，不自动发布 GitHub。
 
+提交前运行 `build_tcl_bundle.ps1 -Check` 校验合并 Tcl。辅助程序的文件版本和 Tcl 包头均取自 `OrCADWheelZoom.manifest`。需要复现 EXE 二进制时，向 `build_wheel_zoom.ps1` 提供支持 `/deterministic` 的 Roslyn `csc.exe` 路径（`-DeterministicCompiler`），两次构建应使用相同的编译器和框架引用程序集。
+
+提交并审阅发布改动后，向 `package_release.ps1 -PrepareDownload -DeterministicCompiler` 提供微软签名有效的 Roslyn `csc.exe` 路径。脚本校验 Git 工作区、模块清单和合并 Tcl，两次构建辅助程序并比较 SHA-256，然后将双文件安装 ZIP、ZIP 校验值和解压文件校验值暂存到 `downloads`。
+
 避免把实际工程、BOM、日志、私人截图或个人路径提交到仓库。模拟测试通过仍需设计副本实机验证；请分别记录“模拟测试通过”和“用户实机确认”，不要混为一谈。
 

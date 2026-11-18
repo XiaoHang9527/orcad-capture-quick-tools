@@ -7,43 +7,60 @@ namespace eval ::OffPageDirection {
 }
 
 proc ::OffPageDirection::Null {o} {expr {$o eq "" || $o eq "NULL"}}
+proc ::OffPageDirection::Enabler {args} {
+    if {[catch {GetSelectedObjects} objects]} {return 0}
+    foreach object $objects {
+        if {![catch {DboBaseObject_GetObjectType $object} type] && $type == 38} {return 1}
+    }
+    return 0
+}
 proc ::OffPageDirection::Check {s stage} {
     if {![$s Succeeded]} {
         set msg [DboTclHelper_sMakeCString]
-        $s Message $msg
-        error "$stage: [DboTclHelper_sGetConstCharPtr $msg] (code [$s Code])"
+        set details ""
+        catch {
+            $s Message $msg
+            set details [DboTclHelper_sGetConstCharPtr $msg]
+        }
+        ::QuickToolsDbo::FreeStrings [list $msg]
+        error "$stage: $details (code [$s Code])"
     }
 }
 # DboState is mutable. A completed iterator leaves code 1022 (normal EOF),
 # which must not be checked as the result of an unrelated property read.
 # Accept 1022 ONLY for Next* returning NULL; all other failures remain fatal.
 proc ::OffPageDirection::Next {iterator method} {
-    set s [DboState]
-    set o [$iterator $method $s]
-    if {[Null $o] && [$s Code] == 1022} {return NULL}
-    Check $s $method
-    return $o
+    return [::QuickToolsDbo::Next $iterator $method]
 }
 proc ::OffPageDirection::Read {o method} {
     set s [DboState]
-    set value [$o $method $s]
-    Check $s $method
+    set code [catch {
+        set value [$o $method $s]
+        Check $s $method
+    } message]
+    catch {$s -delete}
+    if {$code} {error $message}
     return $value
 }
 proc ::OffPageDirection::Text {o method} {
-    set value [DboTclHelper_sMakeCString]
-    Check [$o $method $value] $method
-    return [DboTclHelper_sGetConstCharPtr $value]
+    return [::QuickToolsDbo::String $o $method]
 }
 proc ::OffPageDirection::PropertyValue {o name} {
-    set value [DboTclHelper_sMakeCString]
-    Check [$o GetEffectivePropStringValue [DboTclHelper_sMakeCString $name] $value] "Read property $name"
-    return [DboTclHelper_sGetConstCharPtr $value]
+    return [::QuickToolsDbo::String $o GetEffectivePropStringValue $name]
 }
 proc ::OffPageDirection::SetPropertyVerified {o name value} {
     if {![catch {PropertyValue $o $name} current] && $current eq $value} {return}
-    set s [$o SetEffectivePropStringValue [DboTclHelper_sMakeCString $name] [DboTclHelper_sMakeCString $value]]
-    if {![$s Succeeded] && [$s Code] != 1} {Check $s "Write property $name"}
+    set pointers {}
+    set status ""
+    set code [catch {
+        lappend pointers [DboTclHelper_sMakeCString $name]
+        lappend pointers [DboTclHelper_sMakeCString $value]
+        set status [eval [linsert $pointers 0 $o SetEffectivePropStringValue]]
+        if {![$status Succeeded] && [$status Code] != 1} {Check $status "SetEffectivePropStringValue $name"}
+    } message]
+    ::QuickToolsDbo::FreeStrings $pointers
+    if {![Null $status]} {catch {$status -delete}}
+    if {$code} {error $message}
     if {[PropertyValue $o $name] ne $value} {error "Property value not retained: $name"}
 }
 proc ::OffPageDirection::XY {p} {
@@ -66,12 +83,17 @@ proc ::OffPageDirection::Target {name} {
 }
 proc ::OffPageDirection::Log {message} {
     variable LogFile
-    puts "Off-page toggle: $message"
+    catch {puts "Off-page toggle: $message"}
     if {$LogFile ne ""} {
-        set f [open $LogFile a]
-        fconfigure $f -encoding utf-8
-        puts $f $message
-        close $f
+        set f ""
+        catch {
+            set f [open $LogFile a]
+            fconfigure $f -encoding utf-8
+            puts $f $message
+            close $f
+            set f ""
+        }
+        if {$f ne ""} {catch {close $f}}
     }
 }
 
@@ -94,7 +116,7 @@ proc ::OffPageDirection::Connectors {page} {
 }
 proc ::OffPageDirection::Pages {design} {
     set s [DboState]
-    set views [$design NewViewsIter $s $::IterDefs_SCHEMATICS]
+    set views [$design NewViewsIter $s [::QuickToolsDbo::SchematicMode]]
     Check $s NewViewsIter
     if {[Null $views]} {error "Cannot enumerate design schematics"}
     set result {}
@@ -195,12 +217,11 @@ proc ::OffPageDirection::WireId {o} {
     Check $s GetWire
     if {[Null $wire]} {return ""}
     set id [$wire GetId $s]
-    Check $s GetWireId
+    Check $s "GetId (connected wire)"
     return $id
 }
 proc ::OffPageDirection::Snapshot {o} {
     array set r {}
-    set r(id) [Read $o GetId]
     set r(name) [Text $o GetName]
     set r(source) [Text $o GetSourceSymbolName]
     set r(library) [Text $o GetSourceLibName]
@@ -208,7 +229,7 @@ proc ::OffPageDirection::Snapshot {o} {
     set r(location) [XY [Read $o GetLocation]]
     set r(hotspot) [XY [Read $o GetOffsetHotSpot]]
     set r(rotation) [Read $o GetRotation]
-    set r(mirror) [Read $o GetMirror]
+    set r(mirror) [MirrorFlag [Read $o GetMirror]]
     set r(color) [Read $o GetColor]
     set r(basis) [Basis $o]
     set r(wire) [WireId $o]
@@ -247,10 +268,14 @@ proc ::OffPageDirection::Snapshot {o} {
     }
     return [array get r]
 }
+proc ::OffPageDirection::MirrorFlag {value} {
+    if {![string is boolean -strict $value]} {error "Unsupported native mirror value: $value"}
+    return [expr {$value ? 1 : 0}]
+}
+
 proc ::OffPageDirection::SetVerified {o setter getter value {kind scalar}} {
     if {$kind eq "text"} {
         set before [Text $o $getter]
-        set argument [DboTclHelper_sMakeCString $value]
     } elseif {$kind eq "point"} {
         set before [XY [Read $o $getter]]
         set argument [Point $value]
@@ -258,15 +283,22 @@ proc ::OffPageDirection::SetVerified {o setter getter value {kind scalar}} {
         set before [Read $o $getter]
         set argument $value
     }
+    if {$getter eq "GetMirror"} {set before [MirrorFlag $before]}
     # Capture can return code 1 for a setter. Avoid no-op writes altogether;
     # never assume that code 1 by itself means success.
     if {$before eq $value} {return}
-    set result [$o $setter $argument]
+    if {$kind eq "text"} {
+        set argument [DboTclHelper_sMakeCString $value]
+    }
+    set code [catch {$o $setter $argument} result]
+    if {$kind eq "text"} {::QuickToolsDbo::FreeStrings [list $argument]}
+    if {$code} {error $result}
     if {$kind eq "text"} {
         set after [Text $o $getter]
     } elseif {$kind eq "point"} {
         set after [XY [Read $o $getter]]
     } else {set after [Read $o $getter]}
+    if {$getter eq "GetMirror"} {set after [MirrorFlag $after]}
     if {![$result Succeeded] && [$result Code] != 1} {Check $result $setter}
     if {$after ne $value} {error "$setter not retained: expected=$value actual=$after code=[$result Code]"}
     if {![$result Succeeded]} {Log "$setter code=[$result Code], verified actual value=$after"}
@@ -341,13 +373,16 @@ proc ::OffPageDirection::Verify {o snapshot expected basis} {
     set s [DboState]
     if {[Text $o GetName] ne $r(name)} {error "Net name did not survive replacement"}
     if {![string equal -nocase [Text $o GetSourceSymbolName] $expected]} {error "Capture did not retain symbol $expected"}
-    if {[XY [$o GetOffsetHotSpot $s]] ne $r(hotspot)} {error "Connection point moved"}
+    if {[XY [Read $o GetOffsetHotSpot]] ne $r(hotspot)} {error "Connection point moved"}
     if {[Basis $o] ne $basis} {error "Graphic orientation did not change as requested"}
+    if {[Read $o GetColor] ne $r(color)} {error "Connector color changed"}
+    if {[string equal -nocase $expected $r(source)] &&
+        ([Read $o GetRotation] ne $r(rotation) || [MirrorFlag [Read $o GetMirror]] ne $r(mirror))} {
+        error "Original connector rotation or mirror flag changed"
+    }
     if {[WireId $o] ne $r(wire)} {error "Wire attachment changed"}
     foreach pair $r(users) {
-        set value [DboTclHelper_sMakeCString]
-        Check [$o GetEffectivePropStringValue [DboTclHelper_sMakeCString [lindex $pair 0]] $value] ReadUserProperty
-        if {[DboTclHelper_sGetConstCharPtr $value] ne [lindex $pair 1]} {error "User property did not survive: [lindex $pair 0]"}
+        if {[PropertyValue $o [lindex $pair 0]] ne [lindex $pair 1]} {error "User property did not survive: [lindex $pair 0]"}
     }
     if {[info exists r(displayValues)]} {
         foreach pair $r(displayValues) {
@@ -362,6 +397,29 @@ proc ::OffPageDirection::Verify {o snapshot expected basis} {
             [$p GetColor $s] != $color || [$p GetDisplayType $s] != $type} {
             error "Display property changed: $name"
         }
+        VerifyDisplayFont $p $font $name
+    }
+}
+
+proc ::OffPageDirection::VerifyDisplayFont {property savedFont name} {
+    set actualFont ""
+    set code [catch {
+        set lib [$property GetContainingLib]
+        if {[Null $lib]} {error "No font library available."}
+        set expected [$lib GetFontId $savedFont]
+        set actualFont [DboTclHelper_sMakeLOGFONT]
+        Check [$property GetFont $::DboLib_DEFAULT_FONT_PROPERTY $actualFont] "GetFont ($name)"
+        set actual [$lib GetFontId $actualFont]
+        if {![string is integer -strict $expected] || $expected < 0 ||
+            ![string is integer -strict $actual] || $actual < 0} {error "Font ID unavailable."}
+    } message]
+    if {$actualFont ne "" && [llength [info commands DboTclHelper_sDeleteLOGFONT]]} {
+        catch {DboTclHelper_sDeleteLOGFONT $actualFont}
+    }
+    if {$code} {
+        Log "Display font verification unavailable for $name: $message"
+    } elseif {$expected != $actual} {
+        error "Display font changed for $name (expected ID $expected, read $actual)."
     }
 }
 proc ::OffPageDirection::Replace {page object snapshot symbol name basis currentIdVar} {
@@ -411,7 +469,7 @@ proc ::OffPageDirection::RestoreOriginal {page o saved idVar} {
         if {[$fresh GetObjectType] != 38} {error "Restoration did not return an off-page connector"}
         set o [DboNetSymbolInstanceToDboOffPageConnector [DboGraphicInstanceToDboNetSymbolInstance $fresh]]
         set id [Read $o GetId]
-        if {[catch {Check $s RestoreGraphicInst} why]} {lappend failures $why}
+        if {[catch {Check $s "ReplaceGraphicInst (rollback)"} why]} {lappend failures $why}
     }
     foreach action [list \
         [list SetVerified $o SetName GetName $r(name) text] \
@@ -439,10 +497,12 @@ proc ::OffPageDirection::Execute {} {
     set design [$page GetContainingLib]
     set pages [Pages $design]
     set plan {}
+    set skipped 0
     array set symbols {}
     foreach o [Connectors $page] {
         set id [$o GetId $s]
         if {![info exists selected($id)]} {continue}
+        if {[string equal -nocase [Text $o GetSourceSymbolName] O-L-I]} {incr skipped; continue}
         if {[$o IsObjLocked]} {error "Selected off-page connector is locked: $id"}
         array set r [Snapshot $o]
         Log "SNAPSHOT id=$id name=[list $r(name)] source=$r(source) rotation=$r(rotation) mirror=$r(mirror) location=$r(location) hotspot=$r(hotspot)"
@@ -452,7 +512,9 @@ proc ::OffPageDirection::Execute {} {
         set symbol $symbols($key)
         lappend plan [list $id [array get r] $symbol $target]
     }
-    if {[llength $plan] != [array size selected]} {error "Selection is not confined to the current page"}
+    if {[llength $plan] + $skipped != [array size selected]} {error "Selection is not confined to the current page"}
+    if {$skipped} {Log "Skipped $skipped O-L-I connector(s)"}
+    if {![llength $plan]} {return}
     # The user explicitly requested direct execution, including the first use.
     # Backup/usage guidance is in Alt+F1; validation and recovery stay enabled.
     # All lookups and snapshots completed before the first write. Clear editor
@@ -471,18 +533,16 @@ proc ::OffPageDirection::Execute {} {
             if {[Null $o]} {error "Selected object disappeared before replacement"}
             lappend journal [list $currentId $snapshot]
             set inFlight 1
-            set new [Replace $page $o $snapshot $symbol $target [Reflected $r(basis)] currentId]
+            Replace $page $o $snapshot $symbol $target [Reflected $r(basis)] currentId
             set journal [lreplace $journal end end [list $currentId $snapshot]]
             set inFlight 0
             incr changed
         }
         Check [$page MarkModified] MarkModified
         DboTclHelper_sEvalPage $page
-        Menu "View::Zoom::Redraw"
     } message]
     if {$code} {
         set details $::errorInfo
-        Log "FAILED: $details"
         # The failing native call may already have returned a new object ID.
         if {$inFlight} {set journal [lreplace $journal end end [list $currentId $snapshot]]}
         set failures {}
@@ -499,12 +559,14 @@ proc ::OffPageDirection::Execute {} {
         }
         catch {DboTclHelper_sEvalPage $page}
         catch {Menu "View::Zoom::Redraw"}
+        catch {Log "FAILED: $details"}
         if {[llength $failures]} {
             Log "RESTORE FAILURES: $failures"
             error "$message\n\nRESTORE FAILED: $failures\nClose this test copy WITHOUT saving and reopen your backup."
         }
         error "$message\n\nProcessed connectors restored. No success reported."
     }
+    catch {Menu "View::Zoom::Redraw"}
     Log "SUCCESS: changed=$changed; names, connection points and wire IDs verified"
 }
 proc ::OffPageDirection::Run {} {
@@ -513,7 +575,7 @@ proc ::OffPageDirection::Run {} {
     if {$Busy} {return}
     set Busy 1
     set code [catch {
-        set LogFile [file join $::env(TEMP) OrCADOffPageToggle.log]
+        set LogFile [::OrCADQuickTools::TempPath OrCADOffPageToggle.log]
         Log "--- [clock format [clock seconds]] version=0.2.5 ---"
         Execute
     } message]

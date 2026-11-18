@@ -3,6 +3,9 @@ set ::offpageSavedTemp $::env(TEMP)
 set ::offpageTestTemp [file join $::env(TEMP) OrCADOffPageTest-[pid]-[clock clicks]]
 file mkdir $::offpageTestTemp
 set ::env(TEMP) $::offpageTestTemp
+if {[info exists ::env(TMP)]} {set ::offpageSavedTmp $::env(TMP)}
+set ::env(TMP) $::offpageTestTemp
+source [file join [file dirname [info script]] src OrCADQuickTools.core.tcl]
 source [file join [file dirname [info script]] src OrCADOffPageToggle.tcl]
 proc assert {value message} {if {!$value} {error $message}}
 set ::statusSerial 0
@@ -425,7 +428,46 @@ assert [expr {[llength $::messages]==1 && $::writes==0 && !$::OffPageDirection::
 set errorDialog [lindex $::messages 0]
 assert [expr {[lindex $errorDialog [expr {[lsearch -exact $errorDialog -icon]+1}]] eq "error"}] "Failure dialog is not an error"
 puts "PASS: first/repeated Alt+F5 execute silently; names and geometry verified; actual error popup retained"
+reset
+set ::OffPageDirection::LogFile $::offpageTestTemp
+set ::badTarget 1
+assert [catch {::OffPageDirection::Execute} why] "Injected replacement failure must abort"
+assert [expr {[string first "RESTORE FAILED" $why] < 0 && $::data(n$::serial,source) eq "OFFPAGELEFT-L"}] "Logging failure blocked rollback"
+reset
+rename Menu NativeMenu
+proc Menu args {error "redraw unavailable"}
+::OffPageDirection::Execute
+assert [expr {$::writes == 1 && $::data(n$::serial,source) eq "OFFPAGELEFT-R"}] "Redraw failure triggered rollback"
+rename Menu {}
+rename NativeMenu Menu
+reset
+set ::data(o1,source) O-L-I
+::OffPageDirection::Execute
+assert [expr {$::writes == 0}] "O-L-I was modified"
+puts "PASS: failed log cannot block rollback, redraw failure preserves replacement, O-L-I is ignored"
+
+proc fontVerificationProperty {method args} {
+    switch -- $method {
+        GetContainingLib {return fontVerificationLibrary}
+        GetFont {return good}
+        default {error $method}
+    }
+}
+proc fontVerificationLibrary {method font} {
+    if {$method ne "GetFontId"} {error $method}
+    if {$font eq "savedFont"} {return 11}
+    return $::testActualFontId
+}
+set ::testActualFontId 11
+::OffPageDirection::VerifyDisplayFont fontVerificationProperty savedFont IREF
+set ::testActualFontId 12
+assert [catch {::OffPageDirection::VerifyDisplayFont fontVerificationProperty savedFont IREF} why] "A mismatched font should fail verification"
+assert [expr {[string first "Display font changed for IREF" $why] == 0}] "Font error lacks the property name"
+assert [expr {[::OffPageDirection::MirrorFlag true] == 1 && [::OffPageDirection::MirrorFlag off] == 0}] "Mirror flags not normalized"
+assert [catch {::OffPageDirection::MirrorFlag unavailable}] "Unknown mirror value accepted"
+puts "PASS: font ID comparison detects changes and mirror flags are normalized"
 set ::env(TEMP) $::offpageSavedTemp
+if {[info exists ::offpageSavedTmp]} {set ::env(TMP) $::offpageSavedTmp} else {unset ::env(TMP)}
 if {[file exists [file join $::offpageTestTemp OrCADOffPageToggle.log]]} {
     file delete [file join $::offpageTestTemp OrCADOffPageToggle.log]
 }

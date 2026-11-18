@@ -6,17 +6,14 @@ namespace eval ::OrCADWheel {
     if {![info exists Timer]} { variable Timer "" }
     if {![info exists CheckTimer]} {variable CheckTimer ""}
     if {![info exists Running]} {variable Running 0}
-    foreach {name initial} {WriteFailures 0 HealthFailures 0 Recovering 0 Recoveries 0 RecoveryWindow 0 NextRecovery 0} {
+    foreach {name initial} {WriteFailures 0 HealthFailures 0 Recovering 0 Recoveries 0 RecoveryWindow 0 NextRecovery 0 StopChannel {} StartNotify 0} {
         if {![info exists $name]} {variable $name $initial}
     }
-    if {![info exists StateFile]} {
-        variable StateFile [file join $::env(TEMP) OrCADWheelZoom-[pid]-[clock clicks].state]
-    }
-    variable LogFile [file join $::env(TEMP) OrCADWheelZoom-[pid].log]
-    variable ControllerLogFile [file join $::env(TEMP) OrCADWheelZoom-[pid]-controller.log]
-    set base $::env(TEMP)
-    if {[info exists ::env(LOCALAPPDATA)]} {set base $::env(LOCALAPPDATA)}
-    variable Preference [file join $base OrCADQuickTools wheel-zoom.enabled]
+    unset name initial
+    if {![info exists StateFile]} {variable StateFile ""}
+    variable LogFile [::OrCADQuickTools::TempPath OrCADWheelZoom-[pid].log]
+    variable ControllerLogFile [::OrCADQuickTools::TempPath OrCADWheelZoom-[pid]-controller.log]
+    variable Preference [::OrCADQuickTools::PreferencePath wheel-zoom.enabled]
 }
 
 proc ::OrCADWheel::Log {message} {
@@ -37,8 +34,8 @@ proc ::OrCADWheel::Log {message} {
 proc ::OrCADWheel::Recover {reason} {
     variable Enabled; variable Running; variable Recovering
     variable Recoveries; variable RecoveryWindow; variable NextRecovery
-    variable Directory; variable StateFile; variable CheckTimer; variable HealthFailures
-    if {!$Enabled || $CheckTimer ne ""} {return}
+    variable CheckTimer; variable HealthFailures; variable StopChannel
+    if {!$Enabled || $CheckTimer ne "" || $StopChannel ne ""} {return}
     set now [clock seconds]
     if {$now < $NextRecovery} {return}
     if {$now - $RecoveryWindow >= 60} {set RecoveryWindow $now; set Recoveries 0}
@@ -51,47 +48,92 @@ proc ::OrCADWheel::Recover {reason} {
     set NextRecovery [expr {$now + 10}]
     set Running 0; set Recovering 1; set HealthFailures 0
     Log "Recovery attempt=$Recoveries; reason=$reason"
-    set helper [file join $Directory OrCADWheelZoom.exe]
-    if {[catch {
-        # Stop waits for the previous helper's single-instance mutex to release.
-        # If it cannot stop, do not launch another listener or kill Capture.
-        exec $helper --stop [pid]
-        ::OrCADWheel::WriteText "$StateFile.status" starting
-        ::OrCADWheel::WriteText $StateFile "hover 0"
-        exec $helper --run [pid] $StateFile &
-    } err]} {
+    if {[catch {RequestStop} err]} {
         set Recovering 0
-        Log "Recovery could not launch: $err; retry remains enabled"
+        Log "Recovery could not request stop: $err; retry remains enabled"
+    }
+}
+
+# The worker waits for the native mutex. Capture reads its result only after
+# pipe EOF, so a stuck helper never blocks the Capture event loop.
+proc ::OrCADWheel::RequestStop {} {
+    variable Directory; variable StopChannel; variable StateFile
+    if {$StopChannel ne ""} {return}
+    if {$StateFile ne ""} {catch {WriteText $StateFile 0}}
+    set helper [file join $Directory OrCADWheelZoom.exe]
+    set channel [open [linsert [list $helper --stop [pid]] 0 |] r]
+    fconfigure $channel -blocking 0
+    fileevent $channel readable [list ::OrCADWheel::ReadStopResult $channel]
+    set StopChannel $channel
+}
+
+proc ::OrCADWheel::ReadStopResult {channel} {
+    catch {read $channel}
+    if {![eof $channel]} {return}
+    fileevent $channel readable {}
+    # This worker emits no stdout and only closes the pipe on process exit.
+    # Blocking close at EOF gives Tcl the actual child exit status.
+    fconfigure $channel -blocking 1
+    set failed [catch {close $channel} message]
+    StopFinished $failed $message
+}
+
+proc ::OrCADWheel::StopFinished {failed message} {
+    variable StopChannel; variable StateFile; variable Enabled
+    variable Recovering; variable StartNotify
+    set StopChannel ""
+    if {$failed} {
+        set Recovering 0
+        Log "Helper exit not confirmed: $message"
+        catch {puts "Mouse navigation helper did not confirm shutdown. Diagnostic: $message"}
+        if {!$Enabled || $StartNotify} {
+            catch {tk_messageBox -type ok -icon warning -title "Wheel Zoom" \
+                -message "The mouse navigation helper did not confirm shutdown.\n$message"}
+        }
         return
     }
-    set CheckTimer [after 200 [list ::OrCADWheel::CheckStarted 0 0]]
+    if {$StateFile ne ""} {
+        catch {file delete -- $StateFile "$StateFile.status"}
+        set StateFile ""
+    }
+    if {$Enabled} {
+        if {[catch {StartHelper $StartNotify} message]} {
+            if {$Recovering} {
+                set Recovering 0
+                Log "Helper could not restart: $message"
+            } else {Fail $message $StartNotify}
+        }
+    } else {
+        catch {puts "Wheel zoom disabled."}
+    }
 }
 
 proc ::OrCADWheel::ReadText {path} {
     set f [open $path r]
-    if {[catch {set result [read $f]; close $f} err]} {catch {close $f}; error $err}
+    if {[catch {fconfigure $f -encoding utf-8; set result [read $f]; close $f} err]} {catch {close $f}; error $err}
     return [string trim $result]
 }
 
 proc ::OrCADWheel::WriteText {path text} {
     set f [open $path w]
-    if {[catch {puts $f $text; close $f} err]} {catch {close $f}; error $err}
+    if {[catch {fconfigure $f -encoding utf-8; puts $f $text; close $f} err]} {catch {close $f}; error $err}
 }
 
 proc ::OrCADWheel::Remember {value} {
     variable Preference
+    if {$Preference eq ""} {error "No writable directory for the mouse navigation preference."}
     file mkdir [file dirname $Preference]
     ::OrCADWheel::WriteText $Preference $value
 }
 
 proc ::OrCADWheel::Fail {message notify} {
-    variable LogFile
+    variable LogFile; variable ControllerLogFile
     Log "Startup failed: $message"
     catch {::OrCADWheel::Disable}
     puts "Wheel zoom NOT running: $message; log=$LogFile"
     if {$notify} {
         catch {tk_messageBox -icon error -type ok -title "Wheel Zoom" \
-            -message "\u6EDA\u8F6E\u7F29\u653E\u672A\u80FD\u542F\u52A8\uFF1A\n$message\n\n\u65E5\u5FD7\uFF1A\n$LogFile"}
+            -message "\u6EDA\u8F6E\u7F29\u653E\u672A\u80FD\u542F\u52A8\uFF1A\n$message\n\n\u65E5\u5FD7\uFF1A\n$ControllerLogFile\n$LogFile"}
     }
 }
 
@@ -105,15 +147,20 @@ proc ::OrCADWheel::CheckStarted {attempt notify} {
     set CheckTimer ""
     if {!$Enabled} {return}
     set status ""
-    catch {set status [::OrCADWheel::ReadText "$StateFile.status"]}
+    catch {
+        if {[clock seconds] - [file mtime "$StateFile.status"] <= 5} {
+            set status [ReadText "$StateFile.status"]
+        }
+    }
     if {[string match "running*" $status]} {
         if {$Recovering} {Log "Recovery acknowledged; mouse navigation running"}
         set Recovering 0; set HealthFailures 0
         set Running 1
         puts "Mouse navigation helper running: plain wheel zoom and direct right-button grab pan (no middle-button mode)."
         if {$notify} {
-            catch {::OrCADWheel::Remember 1}
+            if {[catch {Remember 1} message]} {Log "Could not save preference: $message"}
         }
+        set ::OrCADWheel::StartNotify 0
         return
     }
     if {[string match "error:*" $status] || $status == "stopped" || $attempt >= 25} {
@@ -137,8 +184,14 @@ proc ::OrCADWheel::Heartbeat {} {
     variable WriteFailures
     variable HealthFailures
     variable CheckTimer
+    variable StopChannel
     set Timer ""
     if {!$Enabled} {return}
+    if {$StopChannel ne "" || $StateFile eq ""} {
+        if {$StopChannel eq ""} {Recover "Helper not running"}
+        set Timer [after 400 ::OrCADWheel::Heartbeat]
+        return
+    }
     set active 0
     catch {set active [expr {[IsSchematicViewActive] == 1}]}
     if {[catch {
@@ -172,11 +225,8 @@ proc ::OrCADWheel::Heartbeat {} {
 }
 
 proc ::OrCADWheel::Enable {{notify 0}} {
-    variable Directory
-    variable Enabled
-    variable StateFile
-    variable Running
-    variable CheckTimer
+    variable Directory; variable Enabled; variable Running; variable Timer
+    variable StateFile; variable StopChannel; variable StartNotify
     variable Recovering; variable Recoveries; variable NextRecovery
     variable WriteFailures; variable HealthFailures
     if {$Enabled} {return}
@@ -185,21 +235,34 @@ proc ::OrCADWheel::Enable {{notify 0}} {
     Log "Enable requested; notify=$notify"
     set helper [file join $Directory OrCADWheelZoom.exe]
     if {![file exists $helper]} {error "Missing OrCADWheelZoom.exe; run build_wheel_zoom.ps1 first."}
-    ::OrCADWheel::WriteText "$StateFile.status" "starting"
     set Enabled 1
     set Running 0
-    # Mark initial startup before Heartbeat, so it cannot start a recovery helper.
-    set CheckTimer [after 200 [list ::OrCADWheel::CheckStarted 0 $notify]]
-    ::OrCADWheel::Heartbeat
-    if {!$Enabled} {error "Cannot write wheel state file."}
-    if {[catch {exec $helper --run [pid] $StateFile &} err]} {
+    set StartNotify $notify
+    if {[catch {
+        if {$StopChannel eq ""} {
+            if {$StateFile eq ""} {StartHelper $notify} else {RequestStop}
+        }
+    } err]} {
         catch {::OrCADWheel::Disable}
         error $err
     }
+    if {$Timer eq ""} {set Timer [after 400 ::OrCADWheel::Heartbeat]}
+}
+
+proc ::OrCADWheel::StartHelper {notify} {
+    variable Directory; variable StateFile; variable CheckTimer
+    set path [::OrCADQuickTools::TempPath OrCADWheelZoom-[pid]-[clock clicks].state]
+    if {$path eq ""} {error "No writable temporary directory for mouse navigation."}
+    set StateFile $path
+    set active 0
+    catch {set active [expr {[IsSchematicViewActive] == 1}]}
+    WriteText $StateFile "hover $active"
+    WriteText "$StateFile.status" starting
+    exec [file join $Directory OrCADWheelZoom.exe] --run [pid] $StateFile &
+    set CheckTimer [after 200 [list ::OrCADWheel::CheckStarted 0 $notify]]
 }
 
 proc ::OrCADWheel::Disable {} {
-    variable Directory
     variable Enabled
     variable Timer
     variable StateFile
@@ -212,9 +275,7 @@ proc ::OrCADWheel::Disable {} {
     set Recovering 0
     if {$Timer != ""} {after cancel $Timer; set Timer ""}
     if {$CheckTimer != ""} {after cancel $CheckTimer; set CheckTimer ""}
-    catch {::OrCADWheel::WriteText $StateFile 0}
-    exec [file join $Directory OrCADWheelZoom.exe] --stop [pid]
-    puts "Wheel zoom disabled."
+    if {$StateFile ne ""} {RequestStop}
 }
 
 proc ::OrCADWheel::Toggle {} {
@@ -222,8 +283,9 @@ proc ::OrCADWheel::Toggle {} {
     Log "User menu toggle; enabled=$Enabled"
     if {[catch {
         if {$Enabled} {
+            set failed [catch {::OrCADWheel::Remember 0} preferenceError]
             ::OrCADWheel::Disable
-            ::OrCADWheel::Remember 0
+            if {$failed} {error $preferenceError}
         } else {::OrCADWheel::Enable 1}
     } err]} {
         tk_messageBox -icon error -type ok -title "Wheel Zoom" -message $err

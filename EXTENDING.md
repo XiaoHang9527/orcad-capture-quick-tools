@@ -88,3 +88,20 @@ Capture 16.6 同一会话反复注销/注册可能留下失效的快捷键。当
 修改 C# 鼠标辅助程序后先运行 `build_wheel_zoom.ps1`，或打包时使用 `package_release.ps1 -RebuildMouseHelper`。默认打包保留已有 EXE，不重新编译已验证的鼠标程序。
 
 打包同时生成仅含两个运行文件的 `*-runtime.zip` 和包含说明/源码/测试的完整分享包。不要把开发源码、测试脚本或旧模块重新复制回自动加载目录。
+
+## 读取与写入 Capture 数据库
+
+`::QuickToolsDbo::String` 适用于通过 CString 输出参数返回文本的 API。`Read` 适用于接收 DboState 并直接返回对象或数值的 API。两者都检查 Capture 返回的状态。
+
+```tcl
+set value [::QuickToolsDbo::String $part GetPartValue]
+set ref [::QuickToolsDbo::String $part GetEffectivePropStringValue Reference]
+set package [::QuickToolsDbo::Read $part GetPackage]
+foreach pin [::QuickToolsDbo::Objects $part NewPinsIter NextPin delete_DboPartInstPinsIter] {
+    set number [::QuickToolsDbo::String $pin GetPinNumber]
+}
+```
+
+`Objects` 会释放迭代器，并在重复返回同一对象或遇到异常状态时停止。正常结束为空对象且调用成功，或者为空对象且状态为 1022。网络查询中的 1021 和 1043 只在网络查询返回空对象时才可按缺失处理。
+
+`WriteStrings $object $method 1 ...` 会释放入参 CString，并要求写入方法返回有效状态。修改设计后仍需读回确认。批量写入先完成预检，再保存原值，以便失败时恢复。枚举返回的器件、引脚和缓存封装是 Capture 持有的对象。

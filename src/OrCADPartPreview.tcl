@@ -4,9 +4,8 @@ namespace eval ::PartPreview {
     foreach {name value} {Enabled 1 Initialized 0 Registered 0 Pending {} Busy 0 LastSignature {} LastError {}} {
         if {![info exists $name]} {variable $name $value}
     }
-    set base $::env(TEMP)
-    if {[info exists ::env(LOCALAPPDATA)]} {set base $::env(LOCALAPPDATA)}
-    variable Preference [file join $base OrCADQuickTools part-preview.enabled]
+    unset name value
+    variable Preference [::OrCADQuickTools::PreferencePath part-preview.enabled]
 }
 
 # Extension point: label, effective-property aliases (in priority order),
@@ -150,6 +149,10 @@ proc ::PartPreview::Toggle {} {
     set Enabled [expr {!$Enabled}]
     if {$Pending ne ""} {after cancel $Pending; set Pending ""}
     set LastSignature ""
+    if {$Preference eq ""} {
+        puts "Part preview: preference could not be saved; no writable directory."
+        return
+    }
     set f ""; set staging "$Preference.[pid]-[clock clicks].tmp"
     if {[catch {
         file mkdir [file dirname $Preference]

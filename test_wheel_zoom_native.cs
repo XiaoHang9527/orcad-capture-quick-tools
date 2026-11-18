@@ -193,20 +193,21 @@ internal static class WheelNativeTests
         Equal(Reason(inside:false), "outside-client-area", "scrollbar");
         Equal(Reason(id:260), "not-capture-drawing-view", "wrong control ID");
         var pan = new OrCADWheelZoom.PanGesture();
+        int threshold = OrCADWheelZoom.PanStartThreshold;
         Equal(pan.Mode, 0, "no pan before right-down");
-        Equal(pan.Move(100,100,6), false, "move without down is not pan");
+        Equal(pan.Move(100,100,threshold), false, "move without down is not pan");
         pan.Begin(-100,200);
-        Equal(pan.Move(-95,205,6), false, "minor hand shake remains a click");
+        Equal(pan.Move(-97,203,threshold), false, "three-pixel hand shake remains a click");
         Equal(pan.Release(), 1, "pending release replays a right click");
         Equal(pan.Mode, 0, "right click resets gesture");
         pan.Begin(-100,200);
-        Equal(pan.Move(-106,200,6), true, "leftward threshold starts pan");
-        Equal(pan.Move(-150,100,6), false, "grab initialized once only");
+        Equal(pan.Move(-104,200,threshold), true, "four-pixel leftward movement starts pan");
+        Equal(pan.Move(-150,100,threshold), false, "grab initialized once only");
         Equal(pan.Release(), 2, "drag release stops view changes, not context menu");
         pan.Begin(10,10);
-        Equal(pan.Move(10,16,6), true, "vertical drag starts pan");
+        Equal(pan.Move(10,14,threshold), true, "four-pixel vertical movement starts pan");
         pan.Cancel();
-        Equal(pan.Move(100,100,6), false, "cancelled gesture cannot restart on movement");
+        Equal(pan.Move(100,100,threshold), false, "cancelled gesture cannot restart on movement");
         Equal(pan.Release(), 3, "cancelled right-up must be consumed");
         Equal(pan.Release(), 0, "repeated release must not restart scrolling");
         pan.Begin(10,10); pan.Cancel(); pan.Begin(20,20);
@@ -251,7 +252,8 @@ internal static class WheelNativeTests
         Equal(routed,true,"unchanged drawing route can use its frame");
         Equal(selected.Target,frame,"responsive frame cached");
         Equal(attempts,2,"one fallback after verified unchanged position");
-        foreach (var failure in new OrCADWheelZoom.ScrollResult[] {OrCADWheelZoom.ScrollResult.Failed,OrCADWheelZoom.ScrollResult.UnexpectedPosition}) {
+        foreach (var failure in new OrCADWheelZoom.ScrollResult[] {OrCADWheelZoom.ScrollResult.Failed,
+            OrCADWheelZoom.ScrollResult.UnexpectedPosition, OrCADWheelZoom.ScrollResult.Delayed}) {
             attempts=0;
             routed=OrCADWheelZoom.FindScrollRoute(routes,397,delegate(OrCADWheelZoom.ScrollRoute route,int desired) {
                 attempts++; return failure;
@@ -264,6 +266,15 @@ internal static class WheelNativeTests
             return OrCADWheelZoom.ScrollResult.Unchanged;
         },out selected);
         Equal(routed,false,"ignored messages must not claim pan success");
+        int readbackLimit = OrCADWheelZoom.PanReadbackLimitMs;
+        Equal(OrCADWheelZoom.DelayedScrollResult(390,397,390,readbackLimit - 1),
+            OrCADWheelZoom.ScrollResult.Delayed,"an outstanding thumb position waits for readback");
+        Equal(OrCADWheelZoom.DelayedScrollResult(390,397,397,readbackLimit - 1),
+            OrCADWheelZoom.ScrollResult.Applied,"late verified movement is accepted");
+        Equal(OrCADWheelZoom.DelayedScrollResult(390,397,390,readbackLimit),
+            OrCADWheelZoom.ScrollResult.Unchanged,"unapplied command releases its readback slot");
+        Equal(OrCADWheelZoom.DelayedScrollResult(390,397,398,0),
+            OrCADWheelZoom.ScrollResult.UnexpectedPosition,"unexpected movement remains unsafe");
         Equal(OrCADWheelZoom.ScrollbarUsable(true,true),true,"enabled live scrollbar");
         Equal(OrCADWheelZoom.ScrollbarUsable(false,true),false,"disabled scrollbar with stale nonzero range");
         Equal(OrCADWheelZoom.ScrollbarUsable(true,false),false,"hidden control is not scrollable");
@@ -340,6 +351,12 @@ internal static class WheelNativeTests
         });
         Equal(continued,true,"fitted horizontal axis does not cancel vertical pan");
         Equal(verticalCalls,1,"vertical movement must still run after blocked horizontal axis");
+        verticalCalls=0;
+        continued=OrCADWheelZoom.MoveBothAxes(delegate { return OrCADWheelZoom.AxisResult.Idle; },delegate {
+            verticalCalls++; return OrCADWheelZoom.AxisResult.Applied;
+        });
+        Equal(continued,true,"horizontal readback does not cancel vertical pan");
+        Equal(verticalCalls,1,"vertical movement still runs during horizontal readback");
         continued=OrCADWheelZoom.MoveBothAxes(delegate { return OrCADWheelZoom.AxisResult.Applied; },delegate {
             return OrCADWheelZoom.AxisResult.Unavailable;
         });
@@ -352,7 +369,7 @@ internal static class WheelNativeTests
         continued=OrCADWheelZoom.MoveBothAxes(delegate { return OrCADWheelZoom.AxisResult.Unsafe; },delegate {
             verticalCalls++; return OrCADWheelZoom.AxisResult.Applied;
         });
-        Equal(continued,false,"uncertain timeout stops whole gesture");
+        Equal(continued,false,"unexpected movement stops whole gesture");
         Equal(verticalCalls,0,"no further scrolling after uncertain result");
         continued=OrCADWheelZoom.MoveBothAxes(delegate { return OrCADWheelZoom.AxisResult.Idle; },delegate {
             return OrCADWheelZoom.AxisResult.Unsafe;

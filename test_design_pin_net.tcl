@@ -7,6 +7,7 @@ set ::IterDefs_SCHEMATICS 7
 set ::made 0; set ::deleted 0; set ::states 0; set ::stateDeleted 0
 set ::strings 0; set ::stringDeleted 0; set ::fault {}; set ::reused 0
 set ::messages {}; set ::active 1; set ::target {}; set ::eofCode 1022
+set ::eofToken NULL
 array set ::lookups {}
 proc DboState {} {
     set name state[incr ::states]; set ::codes($name) 0
@@ -37,7 +38,7 @@ proc iterator {items method state} {
 proc iterate {name method state} {
     assert {$method eq $::next($name)} "Wrong iterator next method"
     if {$::fault eq $method} {set ::codes($state) 99; return NULL}
-    if {![llength $::items($name)]} {set ::codes($state) $::eofCode; return NULL}
+    if {![llength $::items($name)]} {set ::codes($state) $::eofCode; return $::eofToken}
     set value [lindex $::items($name) 0]; set ::items($name) [lrange $::items($name) 1 end]; return $value
 }
 proc destroy {name} {unset ::items($name) ::next($name); rename $name {}; incr ::deleted}
@@ -116,6 +117,28 @@ proc net {method value} {assert {$method eq "GetNetName"} "Unexpected net API"; 
 proc tk_messageBox args {lappend ::messages $args; return ok}
 rename ::DesignPinNetExport::ChooseFile ::DesignPinNetExport::NativeChooseFile
 proc ::DesignPinNetExport::ChooseFile {design} {return $::target}
+proc GetSelectedObjects {} {return {u1 u1b zero power}}
+rename ::SelectedPinNetExport::ChooseOutputFile ::SelectedPinNetExport::NativeChooseOutputFile
+proc ::SelectedPinNetExport::ChooseOutputFile {} {return $::target}
+
+set madeBefore $::made
+::SelectedPinNetExport::Execute
+assert {$::made == $madeBefore} "Cancelled selected export still walked pins"
+set ::target mock-selected.xlsx
+rename ::OrCADPinNetXlsx::WriteWorkbook ::OrCADPinNetXlsx::NativeWriteWorkbook
+proc ::OrCADPinNetXlsx::WriteWorkbook {file rows args} {set ::selectedRows $rows}
+set ::eofToken ""
+::SelectedPinNetExport::Execute
+assert {[llength $::selectedRows] == 4} "Selected export did not finish at empty iterator EOF"
+set selectedSheet [::OrCADPinNetXlsx::BuildSheet $::selectedRows]
+assert {[regexp -all {>U301</t>} $selectedSheet] == 2} "Selected export merged different placed units with one reference"
+set ::fault NextPin
+unset ::selectedRows
+assert {[catch {::SelectedPinNetExport::Execute} why] && ![info exists ::selectedRows]} "Failed read still exported selected pins"
+set ::fault {}; set ::target {}; set ::eofToken NULL
+rename ::OrCADPinNetXlsx::WriteWorkbook {}
+rename ::OrCADPinNetXlsx::NativeWriteWorkbook ::OrCADPinNetXlsx::WriteWorkbook
+puts "PASS: selected export cancels before reads, handles empty EOF, separates units, and aborts on iterator failure"
 
 assert {[::DesignPinNetExport::Design] eq "design" && [::DesignPinNetExport::Enabler]} "Visible page did not override stale PM design"
 set rows [::DesignPinNetExport::Collect design stats]

@@ -3,6 +3,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -19,13 +20,13 @@ internal static class OrCADWheelZoom
     static int capturePid;
     static string statePath, logPath;
     static bool active;
-    static int stateMode;
+    static volatile int stateMode;
     static IntPtr hook;
     static HookProc callback = OnMouse;
     static Process capture;
     static EventWaitHandle stop;
     static int wheelCount;
-    const string Version = "wheel-0.21-signals-reusable";
+    static readonly string Version = "wheel-" + Assembly.GetExecutingAssembly().GetName().Version.ToString(2);
     static readonly PanGesture pan = new PanGesture();
     static IntPtr panView;
     static IntPtr panForeground;
@@ -35,9 +36,13 @@ internal static class OrCADWheelZoom
     static DateTime clickReplayQueuedAt;
     internal static readonly UIntPtr RightClickTag = new UIntPtr(0x4F435251u);
     static bool panMovePending;
-    static bool panNeedsInit;
-    static ScrollAxis panHorizontal, panVertical;
+    internal const int PanStartThreshold = 4;
+    internal const uint PanScrollTimeoutMs = 80;
+    internal const int PanReadbackLimitMs = 180;
+    static PanViewport panViewport, panToFinish;
+    static int panWorkerBusy;
     static int panCount;
+    static readonly object reasonLock = new object();
     static readonly Dictionary<string, int> reasonCounts = new Dictionary<string, int>();
     static readonly Dictionary<string, string> reasonDetails = new Dictionary<string, string>();
     static int receivedWheels;
@@ -87,7 +92,22 @@ internal static class OrCADWheelZoom
         internal int Bar, Message, StartPosition, LastRequested, StartClient, ClientLength;
         internal SCROLLINFO Initial;
         internal ScrollRoute Route;
+        internal ScrollRoute PendingRoute;
+        internal int PendingPosition, PendingPrevious;
+        internal long PendingAt;
         internal bool Blocked;
+    }
+
+    sealed class PanViewport
+    {
+        internal readonly IntPtr View, Foreground;
+        internal readonly POINT Start;
+        internal volatile bool Stopped, Failed, NeedsReadback;
+        internal bool WasQueued; // helper message thread only
+        internal bool Initialized; // pan worker only
+        internal ScrollAxis Horizontal, Vertical;
+        internal PanViewport(IntPtr view, IntPtr foreground, POINT start)
+        { View = view; Foreground = foreground; Start = start; }
     }
 
     internal sealed class ScrollRoute
@@ -95,7 +115,7 @@ internal static class OrCADWheelZoom
         internal IntPtr Target, Control;
         internal ScrollRoute(IntPtr target, IntPtr control) { Target = target; Control = control; }
     }
-    internal enum ScrollResult { Failed, Unchanged, Applied, UnexpectedPosition }
+    internal enum ScrollResult { Failed, Unchanged, Applied, UnexpectedPosition, Delayed }
     internal enum AxisResult { Idle, Applied, Unavailable, Unsafe }
     internal delegate ScrollResult ScrollTransport(ScrollRoute route, int position);
 
@@ -136,10 +156,16 @@ internal static class OrCADWheelZoom
     internal static bool MoveBothAxes(Func<AxisResult> horizontal, Func<AxisResult> vertical)
     {
         // A fitted/blocked horizontal axis must not stop vertical movement.
-        // Only uncertainty after sending a command (timeout/wrong position) is
-        // a whole-gesture stop condition.
+        // A pending readback can wait while the other axis moves. An unexpected
+        // position or a failed read invalidates the gesture's scroll geometry.
         if (horizontal() == AxisResult.Unsafe) return false;
         return vertical() != AxisResult.Unsafe;
+    }
+    internal static ScrollResult DelayedScrollResult(int previous, int requested, int actual, double ageMs)
+    {
+        if (actual == requested) return ScrollResult.Applied;
+        if (actual != previous) return ScrollResult.UnexpectedPosition;
+        return ageMs < PanReadbackLimitMs ? ScrollResult.Delayed : ScrollResult.Unchanged;
     }
     [StructLayout(LayoutKind.Sequential)] struct MouseData
     { public POINT Point; public uint Data, Flags, Time; public UIntPtr Extra; }
@@ -200,6 +226,7 @@ internal static class OrCADWheelZoom
     [DllImport("user32.dll")] static extern bool ScreenToClient(IntPtr hwnd, ref POINT pt);
     [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
     [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("kernel32.dll", EntryPoint="SetLastError")] static extern void ClearWin32Error(uint error);
     [DllImport("user32.dll", SetLastError=true)] static extern bool PostThreadMessage(uint thread, uint msg, IntPtr w, IntPtr l);
     [DllImport("user32.dll", SetLastError=true)] static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr w, IntPtr l);
     [DllImport("user32.dll", SetLastError=true)] static extern uint SendInput(uint count, NativeInput[] inputs, int size);
@@ -222,10 +249,23 @@ internal static class OrCADWheelZoom
 
     static void Record(string reason, string detail)
     {
-        int count;
-        reasonCounts.TryGetValue(reason, out count);
-        reasonCounts[reason] = count + 1;
-        reasonDetails[reason] = detail;
+        lock (reasonLock) {
+            int count;
+            reasonCounts.TryGetValue(reason, out count);
+            reasonCounts[reason] = count + 1;
+            reasonDetails[reason] = detail;
+        }
+    }
+
+    static void FlushReasons()
+    {
+        var lines = new List<string>();
+        lock (reasonLock) {
+            foreach (var reason in reasonCounts)
+                lines.Add("reason=" + reason.Key + " count=" + reason.Value + "; " + reasonDetails[reason.Key] + "; posted=" + wheelCount);
+            reasonCounts.Clear(); reasonDetails.Clear();
+        }
+        foreach (string line in lines) Log(line);
     }
 
     static string ConfigureDpi()
@@ -556,9 +596,11 @@ internal static class OrCADWheelZoom
 
     // Direct pan never injects buttons or enters Capture's native pan mode.
     // A stationary single click is replayed separately, outside the hook.
-    static bool PanTargetValid(POINT physical)
+    static bool PanTargetValid(PanViewport viewport)
     {
-        return PointerTargetValid(panView, panForeground, physical, true);
+        POINT cursor;
+        return !viewport.Stopped && GetPhysicalCursorPos(out cursor) &&
+            PointerTargetValid(viewport.View, viewport.Foreground, cursor, true);
     }
 
     static bool PointerTargetValid(IntPtr view, IntPtr foreground, POINT physical, bool allowRightButton)
@@ -616,46 +658,61 @@ internal static class OrCADWheelZoom
         return axis;
     }
 
-    static bool BeginGrab()
+    static bool BeginGrab(PanViewport viewport)
     {
         RECT rect;
         IntPtr oldDpi = IntPtr.Zero;
         try {
-            try { oldDpi = SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(panView)); }
+            try { oldDpi = SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(viewport.View)); }
             catch (EntryPointNotFoundException) {}
-            if (!GetClientRect(panView, out rect) || rect.R <= rect.L || rect.B <= rect.T) return false;
+            if (!GetClientRect(viewport.View, out rect) || rect.R <= rect.L || rect.B <= rect.T) return false;
         } finally { if (oldDpi != IntPtr.Zero) SetThreadDpiAwarenessContext(oldDpi); }
-        panHorizontal = null; panVertical = null;
-        IntPtr childFrame = panView;
+        IntPtr childFrame = viewport.View;
         var owners = new List<IntPtr>();
         // Prefer the drawing's own bars, then bars on its enclosing MDI child.
         // Stop at MDIClient: never borrow scrollbars from the project/command panes.
-        for (IntPtr owner = panView; owner != IntPtr.Zero && ClassOf(owner) != "MDIClient"; owner = GetParent(owner)) {
+        for (IntPtr owner = viewport.View; owner != IntPtr.Zero && ClassOf(owner) != "MDIClient"; owner = GetParent(owner)) {
             owners.Add(owner);
-            if (panHorizontal == null) panHorizontal = MakeAxis(owner, IntPtr.Zero, 0, rect.R-rect.L, panStartClient.X);
-            if (panVertical == null) panVertical = MakeAxis(owner, IntPtr.Zero, 1, rect.B-rect.T, panStartClient.Y);
+            if (viewport.Horizontal == null) viewport.Horizontal = MakeAxis(owner, IntPtr.Zero, 0, rect.R-rect.L, viewport.Start.X);
+            if (viewport.Vertical == null) viewport.Vertical = MakeAxis(owner, IntPtr.Zero, 1, rect.B-rect.T, viewport.Start.Y);
             childFrame = owner;
             IntPtr parent = GetParent(owner);
             if (parent == IntPtr.Zero || ClassOf(parent) == "MDIClient") break;
         }
-        if (panHorizontal == null || panVertical == null) {
+        if (viewport.Horizontal == null || viewport.Vertical == null) {
             EnumChildWindows(childFrame, delegate(IntPtr control, IntPtr unused) {
                 if (ClassOf(control) != "ScrollBar" || !owners.Contains(GetParent(control))) return true;
                 bool vertical = (GetWindowLong(control, -16) & 1) != 0; // SBS_VERT.
-                if (vertical && panVertical == null)
-                    panVertical = MakeAxis(GetParent(control), control, 1, rect.B-rect.T, panStartClient.Y);
-                if (!vertical && panHorizontal == null)
-                    panHorizontal = MakeAxis(GetParent(control), control, 0, rect.R-rect.L, panStartClient.X);
+                if (vertical && viewport.Vertical == null)
+                    viewport.Vertical = MakeAxis(GetParent(control), control, 1, rect.B-rect.T, viewport.Start.Y);
+                if (!vertical && viewport.Horizontal == null)
+                    viewport.Horizontal = MakeAxis(GetParent(control), control, 0, rect.R-rect.L, viewport.Start.X);
                 return true;
             }, IntPtr.Zero);
         }
-        return panHorizontal != null || panVertical != null;
+        return viewport.Horizontal != null || viewport.Vertical != null;
     }
 
-    static AxisResult MoveAxis(ScrollAxis axis, int client)
+    static AxisResult MoveAxis(PanViewport viewport, ScrollAxis axis, int client)
     {
         if (axis == null || axis.Blocked) return AxisResult.Unavailable;
         if (!NativeScrollbarUsable(axis.ScrollWindow, axis.Bar)) { axis.Blocked = true; return AxisResult.Unavailable; }
+        if (axis.PendingRoute != null) {
+            SCROLLINFO actual;
+            if (!ReadScroll(axis.ScrollWindow, axis.Bar, out actual)) return AxisResult.Unsafe;
+            double elapsed = (Stopwatch.GetTimestamp() - axis.PendingAt) * 1000d / Stopwatch.Frequency;
+            ScrollResult readback = DelayedScrollResult(axis.PendingPrevious, axis.PendingPosition, actual.Pos, elapsed);
+            if (readback == ScrollResult.Delayed) return AxisResult.Idle;
+            Record("pan-scroll-readback", "axis=" + axis.Message.ToString("X") + " desired=" + axis.PendingPosition
+                + " actual=" + actual.Pos + " result=" + readback);
+            if (readback == ScrollResult.Applied) axis.Route = axis.PendingRoute;
+            axis.PendingRoute = null;
+            if (readback == ScrollResult.UnexpectedPosition) return AxisResult.Unsafe;
+            if (readback == ScrollResult.Unchanged) {
+                axis.Blocked = true;
+                return AxisResult.Unavailable;
+            }
+        }
         int position = GrabPosition(axis.StartPosition, axis.Initial.Min, axis.Initial.Max,
             axis.Initial.Page, axis.ClientLength, (long)client - axis.StartClient);
         if (position == axis.LastRequested) return AxisResult.Idle;
@@ -666,14 +723,21 @@ internal static class OrCADWheelZoom
         ScrollTransport send = delegate(ScrollRoute route, int desired) {
             SCROLLINFO before;
             if (!ReadScroll(axis.ScrollWindow, axis.Bar, out before)) return lastResponse = ScrollResult.Failed;
+            if (!PanTargetValid(viewport)) return lastResponse = ScrollResult.Failed;
             UIntPtr result;
             // SB_THUMBTRACK (5) is the live-position notification; (4) is just
             // release notification and was ignored in the actual 16.6 log.
             // A notification is not a simulated middle button or an OS drag loop.
+            ClearWin32Error(0);
             if (SendMessageTimeout(route.Target, (uint)axis.Message, new IntPtr(ScrollParameter(desired, LiveScrollCommand)),
-                route.Control, 0x23, 30, out result) == IntPtr.Zero) {
-                Record("pan-scroll-timeout", "axis=" + axis.Message.ToString("X") + " target=" + WindowInfo(route.Target));
-                return lastResponse = ScrollResult.Failed;
+                route.Control, 0x23, PanScrollTimeoutMs, out result) == IntPtr.Zero) {
+                int error = Marshal.GetLastWin32Error();
+                Record("pan-scroll-timeout", "axis=" + axis.Message.ToString("X") + " target=" + WindowInfo(route.Target)
+                    + " win32=" + error);
+                if (error != 0 && error != 1460) return lastResponse = ScrollResult.Failed;
+                axis.PendingRoute = route; axis.PendingPosition = desired; axis.PendingPrevious = before.Pos;
+                axis.PendingAt = Stopwatch.GetTimestamp();
+                return lastResponse = ScrollResult.Delayed;
             }
             SCROLLINFO after;
             if (!ReadScroll(axis.ScrollWindow, axis.Bar, out after)) return lastResponse = ScrollResult.Failed;
@@ -687,9 +751,10 @@ internal static class OrCADWheelZoom
         };
         bool applied;
         if (axis.Route != null) applied = send(axis.Route, position) == ScrollResult.Applied;
-        else applied = FindScrollRoute(ScrollRoutes(panView, axis.Owner, axis.Control), position, send, out axis.Route);
+        else applied = FindScrollRoute(ScrollRoutes(viewport.View, axis.Owner, axis.Control), position, send, out axis.Route);
         axis.LastRequested = position;
         if (applied) return AxisResult.Applied;
+        if (lastResponse == ScrollResult.Delayed) return AxisResult.Idle;
         if (lastResponse == ScrollResult.Unchanged) {
             // A verified no-op is an axis limitation, not an uncertain command.
             // Keep the other axis live; retry availability on the next gesture.
@@ -702,21 +767,31 @@ internal static class OrCADWheelZoom
 
     static void EndGrab(string reason)
     {
-        panMovePending = false; panNeedsInit = false;
-        ScrollAxis horizontal = panHorizontal, vertical = panVertical;
-        panHorizontal = null; panVertical = null;
-        foreach (ScrollAxis axis in new ScrollAxis[] {horizontal, vertical}) {
-            if (axis == null || axis.Route == null || !IsWindow(axis.Route.Target) ||
-                (axis.Route.Control != IntPtr.Zero && !IsWindow(axis.Route.Control))) continue;
-            // End live scroll notifications on the SAME handler that responded.
-            // No final position command that could move the view after release.
+        panMovePending = false;
+        PanViewport viewport = panViewport;
+        panViewport = null;
+        if (viewport == null) return;
+        viewport.Stopped = true;
+        if (viewport.WasQueued) panToFinish = viewport;
+        Record("pan-end", reason);
+    }
+
+    static void FinishGrab(PanViewport viewport)
+    {
+        if (GetForegroundWindow() != viewport.Foreground || !IsWindowVisible(viewport.View)) return;
+        foreach (ScrollAxis axis in new ScrollAxis[] {viewport.Horizontal, viewport.Vertical}) {
+            if (axis == null) continue;
+            ScrollRoute route = axis.Route ?? axis.PendingRoute;
+            if (route == null) continue;
+            uint pid;
+            GetWindowThreadProcessId(route.Target, out pid);
+            if (pid != capturePid || (route.Control != IntPtr.Zero && !IsWindow(route.Control))) continue;
+            // SB_ENDSCROLL terminates tracking without a new thumb position.
             UIntPtr result;
-            if (SendMessageTimeout(axis.Route.Target, (uint)axis.Message, new IntPtr(8),
-                axis.Route.Control, 0x23, 30, out result) == IntPtr.Zero)
+            if (SendMessageTimeout(route.Target, (uint)axis.Message, new IntPtr(8),
+                route.Control, 0x23, PanScrollTimeoutMs, out result) == IntPtr.Zero)
                 Record("pan-end-scroll-timeout", "axis=" + axis.Message.ToString("X"));
         }
-        Record("pan-end", reason);
-        // No synthetic button, middle-pan mode, OS mouse tracking or queued move.
     }
 
     static void CancelPan(string reason)
@@ -725,20 +800,57 @@ internal static class OrCADWheelZoom
         pan.Cancel(); // Keep withholding this gesture's original right-up.
     }
 
-    static void FlushPanMove()
+    static void RunPanFrame(PanViewport viewport, POINT sample)
     {
-        if (pan.Mode != 2 || !panMovePending) return;
-        if (!PanTargetValid(panLatest)) { CancelPan("left-canvas-or-scope"); return; }
-        if (panNeedsInit) {
-            panNeedsInit = false;
-            if (!BeginGrab()) { Record("pan-no-scrollbars", "ancestors=" + Ancestors(panView)); CancelPan("no-scrollable-viewport"); return; }
-            panCount++; Record("pan-start", "target=" + panView.ToInt64().ToString("X"));
+        if (!PanTargetValid(viewport)) { viewport.Failed = true; return; }
+        if (!viewport.Initialized) {
+            if (!BeginGrab(viewport)) {
+                Record("pan-no-scrollbars", "ancestors=" + Ancestors(viewport.View));
+                viewport.Failed = true; return;
+            }
+            viewport.Initialized = true;
+            Interlocked.Increment(ref panCount);
+            Record("pan-start", "target=" + viewport.View.ToInt64().ToString("X"));
         }
         POINT client;
-        if (!ClientPoint(panView, panLatest, false, out client)) { CancelPan("client-conversion-failed"); return; }
-        if (!MoveBothAxes(delegate { return MoveAxis(panHorizontal, client.X); },
-            delegate { return MoveAxis(panVertical, client.Y); })) CancelPan("unsafe-scroll-result");
-        panMovePending = false;
+        if (!ClientPoint(viewport.View, sample, false, out client)) { viewport.Failed = true; return; }
+        if (!MoveBothAxes(delegate { return MoveAxis(viewport, viewport.Horizontal, client.X); },
+            delegate { return MoveAxis(viewport, viewport.Vertical, client.Y); })) {
+            Record("pan-unsafe-scroll", "target=" + viewport.View.ToInt64().ToString("X"));
+            viewport.Failed = true;
+        }
+        viewport.NeedsReadback = (viewport.Horizontal != null && viewport.Horizontal.PendingRoute != null) ||
+            (viewport.Vertical != null && viewport.Vertical.PendingRoute != null);
+    }
+
+    static void QueuePanWork()
+    {
+        PanViewport finishing = panToFinish, current = panViewport;
+        if (finishing == null && (current == null || current.Failed ||
+            (!panMovePending && !current.NeedsReadback))) return;
+        // Only the message thread writes the latest pointer. While Capture is
+        // busy we keep that one sample rather than queueing each mouse move.
+        if (Interlocked.CompareExchange(ref panWorkerBusy, 1, 0) != 0) return;
+        POINT sample = panLatest;
+        try {
+            if (!ThreadPool.QueueUserWorkItem(delegate {
+                try {
+                    if (finishing != null) FinishGrab(finishing);
+                    else if (!current.Stopped) RunPanFrame(current, sample);
+                } catch (Exception ex) {
+                    if (finishing == null) current.Failed = true;
+                    Record("pan-worker-error", ex.GetType().Name + ": " + ex.Message);
+                } finally { Interlocked.Exchange(ref panWorkerBusy, 0); }
+            })) {
+                Interlocked.Exchange(ref panWorkerBusy, 0);
+                return;
+            }
+        } catch {
+            Interlocked.Exchange(ref panWorkerBusy, 0);
+            throw;
+        }
+        if (finishing != null) panToFinish = null;
+        else { current.WasQueued = true; panMovePending = false; }
     }
 
     static bool HandlePan(int message, MouseData mouse)
@@ -760,30 +872,25 @@ internal static class OrCADWheelZoom
             // Never block physical movement: the OS must move the cursor. Only
             // right button down/up are withheld, so no native right-drag begins.
             if (pan.Mode == 3) return false;
-            if (!PanTargetValid(mouse.Point)) { CancelPan("left-canvas-or-scope"); return false; }
             // Physical pixels: minor hand shake must not consume a right click.
-            if (pan.Move(mouse.Point.X, mouse.Point.Y, 6)) {
-                // Defer scroll discovery to the frame timer. Do not put new
-                // cross-process control queries on the mouse callback path.
-                panNeedsInit = true;
+            if (pan.Move(mouse.Point.X, mouse.Point.Y, PanStartThreshold)) {
+                panViewport = new PanViewport(panView, panForeground, panStartClient);
+                panMovePending = true;
                 Record("pan-start-request", "target=" + panView.ToInt64().ToString("X"));
+                QueuePanWork();
+            } else if (pan.Mode == 2) {
+                panMovePending = true;
             }
-            if (pan.Mode == 2) panMovePending = true;
             return false;
         }
         if (message == WM_RBUTTONUP) {
             panLatest = mouse.Point;
-            if (pan.Mode == 1 && PanTargetValid(mouse.Point)) {
-                POINT client;
-                if (ClientPoint(panView, mouse.Point, false, out client)) {
-                    clickReplayView = panView; clickReplayForeground = panForeground;
-                    clickReplayPoint = mouse.Point; clickReplayQueuedAt = DateTime.UtcNow;
-                    Record("pan-right-click-queued", "target=" + panView.ToInt64().ToString("X")
-                        + " cursorPhysical=" + mouse.Point.X + "," + mouse.Point.Y + " client=" + client.X + "," + client.Y);
-                }
+            if (pan.Mode == 1 && !pan.Move(mouse.Point.X, mouse.Point.Y, PanStartThreshold)) {
+                clickReplayView = panView; clickReplayForeground = panForeground;
+                clickReplayPoint = mouse.Point; clickReplayQueuedAt = DateTime.UtcNow;
+                Record("pan-right-click-queued", "target=" + panView.ToInt64().ToString("X")
+                    + " cursorPhysical=" + mouse.Point.X + "," + mouse.Point.Y);
             } else {
-                if (pan.Mode == 2) panMovePending = true;
-                FlushPanMove();
                 EndGrab("right-released");
             }
             pan.Release(); panView = IntPtr.Zero;
@@ -1551,6 +1658,9 @@ internal static class OrCADWheelZoom
                     throw new InvalidOperationException("Target process is not Capture.");
                 string dpiMode = ConfigureDpi();
                 stop = new EventWaitHandle(false, EventResetMode.ManualReset, name);
+                // The controller may have disabled navigation before this
+                // process acquired the mutex or created its stop event.
+                if (!File.Exists(statePath) || ReadControllerState() == "0") return 0;
                 System.Runtime.CompilerServices.RuntimeHelpers.PrepareDelegate(callback);
                 hook = SetWindowsHookEx(WH_MOUSE_LL, callback, GetModuleHandle(null), 0);
                 if (hook == IntPtr.Zero) throw new System.ComponentModel.Win32Exception();
@@ -1568,13 +1678,14 @@ internal static class OrCADWheelZoom
                         }
                         Status("running callbacks=" + mouseCallbacks + " rawWheels=" + rawWheels + " rightDowns=" + rawRightDowns
                             + " received=" + receivedWheels + " remapped=" + wheelCount + " pans=" + panCount + " rearmed=" + hookRearms);
-                        foreach (var reason in reasonCounts)
-                            Log("reason=" + reason.Key + " count=" + reason.Value + "; " + reasonDetails[reason.Key] + "; posted=" + wheelCount);
-                        reasonCounts.Clear(); reasonDetails.Clear();
+                        FlushReasons();
                     }
                     try {
                         bool fresh = (DateTime.UtcNow - File.GetLastWriteTimeUtc(statePath)).TotalSeconds < 2;
                         string state = ReadControllerState();
+                        if (fresh && state == "0") {
+                            Application.ExitThread(); return;
+                        }
                         int previous = stateMode;
                         stateMode = RetainedStateMode(state, fresh, previous);
                         if (state.Length != 0 && fresh) lastControllerRead = DateTime.UtcNow;
@@ -1594,12 +1705,16 @@ internal static class OrCADWheelZoom
                     try {
                         FlushRightClick();
                         if (pan.Mode == 1 || pan.Mode == 2) {
-                            if (!PanTargetValid(panLatest)) CancelPan("scope-changed");
-                            else FlushPanMove();
+                            if (stateMode == 0 || GetForegroundWindow() != panForeground)
+                                CancelPan("scope-changed");
+                            else if (panViewport != null && panViewport.Failed)
+                                CancelPan("worker-stopped");
                         }
+                        QueuePanWork();
                     } catch (Exception ex) { CancelPan("timer: " + ex.Message); }
                 };
                 timer.Start(); panTimer.Start(); Application.Run(); panTimer.Dispose(); timer.Dispose();
+                FlushReasons();
                 Log("Stopped. callbacks=" + mouseCallbacks + "; rawWheels=" + rawWheels + "; rightDowns=" + rawRightDowns
                     + "; received=" + receivedWheels + "; remapped=" + wheelCount + "; pans=" + panCount + "; rearmed=" + hookRearms);
                 Status("stopped");

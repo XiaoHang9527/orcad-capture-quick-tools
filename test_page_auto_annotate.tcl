@@ -6,12 +6,20 @@ proc AddAccessoryMenu {group label callback} {lappend ::accessoryMenus [list $gr
 proc DboSession args {}
 proc DboState {} {return status}
 proc status {method args} {return 1}
-proc DboTclHelper_sMakeCString {{value ""}} {return $value}
-proc DboTclHelper_sGetConstCharPtr {value} {return $value}
+proc DboTclHelper_sMakeCString {args} {
+    if {[llength $args]} {return [lindex $args 0]}
+    set ::stringBuffer ""
+    return outputBuffer
+}
+proc DboTclHelper_sGetConstCharPtr {value} {
+    if {$value eq "outputBuffer"} {return $::stringBuffer}
+    return $value
+}
 proc DboTclHelper_sGetCPointX {point} {return [lindex $point 0]}
 proc DboTclHelper_sGetCPointY {point} {return [lindex $point 1]}
 proc DboBaseObject_GetObjectType {object} {return 13}
 proc DboViewToDboSchematic {view} {return schematic}
+proc DboPartInstToDboPlacedInst {part} {return $part}
 proc DboDesignOccurrencesIter {name design} {
     set ::iterPosition(occurrences) 0
     proc quickToolsOccurrencesIter {method args} {
@@ -28,6 +36,7 @@ proc delete_DboPageTitleBlocksIter args {}
 proc delete_DboPagePartInstsIter args {}
 proc GetActivePage {} {return page1}
 proc tk_messageBox {args} {
+    set ::lastDialog [lindex $args [expr {[lsearch $args -message] + 1}]]
     set index [lsearch $args -type]
     if {$index >= 0 && [lindex $args [expr {$index+1}]] eq "okcancel"} {return ok}
     return ok
@@ -49,6 +58,13 @@ set ::checkPageFirst 1
 set ::accessoryMenus {}
 set ::occurrenceMode 0
 set ::ignorePartSetReference 0
+set ::referenceWrites 0
+array set ::packageFor {part1 singlePackage part2 singlePackage}
+array set ::unit {part1 {} part2 {}}
+array set ::partsByPage {page1 part1 page2 part2}
+proc singlePackage {method args} {if {$method eq "GetSize"} {return 1}; error $method}
+proc dualPackage {method args} {if {$method eq "GetSize"} {return 2}; error $method}
+proc otherDualPackage {method args} {if {$method eq "GetSize"} {return 2}; error $method}
 array set ::occurrenceReferences {occ1 R20 occ2 R50}
 
 proc session {method args} {if {$method eq "GetActiveDesign"} {return design}; error $method}
@@ -125,12 +141,9 @@ proc partspage1 {method args} {return [mockPartIter page1 $method]}
 proc partspage2 {method args} {return [mockPartIter page2 $method]}
 proc mockPartIter {page method} {
     if {$method eq "NextPartInst"} {
-        incr ::iterPosition(parts$page)
-        if {$::iterPosition(parts$page)==1} {
-            if {$page eq "page1"} {return part1}
-            return part2
-        }
-        return NULL
+        set index [expr {[incr ::iterPosition(parts$page)] - 1}]
+        if {$index >= [llength $::partsByPage($page)]} {return NULL}
+        return [lindex $::partsByPage($page) $index]
     }
     error $method
 }
@@ -139,8 +152,15 @@ proc part2 {method args} {return [mockPart part2 $method $args]}
 proc mockPart {part method args} {
     if {$method eq "GetReference"} {return $::references($part)}
     if {$method eq "GetLocation"} {return $::coordinates($part)}
+    if {$method eq "GetPackage"} {return $::packageFor($part)}
+    if {$method eq "GetDeviceDesignator"} {set ::stringBuffer $::unit($part); return status}
     if {$method eq "SetReference"} {
+        incr ::referenceWrites
         if {!$::ignorePartSetReference} {set ::references($part) [lindex $args 0]}
+        if {[info exists ::failRefdes] && [lindex $args 0] eq $::failRefdes} {
+            unset ::failRefdes
+            error "Injected exception after writing a reference"
+        }
         return status
     }
     error $method
@@ -300,6 +320,7 @@ proc occ1 {method args} {return [mockOccurrence occ1 part1 $method $args]}
 proc occ2 {method args} {return [mockOccurrence occ2 part2 $method $args]}
 proc mockOccurrence {occ part method args} {
     if {$method eq "GetPartInst"} {return $part}
+    if {$method eq "GetDesignator"} {set ::stringBuffer $::unit($part); return status}
     if {$method eq "SetReference"} {
         set ::occurrenceReferences($occ) [lindex $args 0]
         return status
@@ -320,6 +341,146 @@ if {$::references(part2) ne "Q201" || $::occurrenceReferences(occ2) ne "Q201" ||
     error "Occurrence reference was not updated: instances=[array get ::references], occurrences=[array get ::occurrenceReferences]"
 }
 puts "PASS: occurrence-visible reference and silent instance write"
+
+set ::ignorePartSetReference 0
+foreach failAt {R900000001 R201} {
+    set ::occurrenceMode 0
+    array set ::references {part1 R201 part2 R101}
+    set ::failRefdes $failAt
+    ::PageAutoAnnotate::RunAll
+    if {[info exists ::failRefdes] || $::references(part1) ne "R201" || $::references(part2) ne "R101"} {
+        error "Reference rollback failed after exception at $failAt: [array get ::references]"
+    }
+}
+puts "PASS: partial temporary and final writes restore original references"
+
+rename schematic nativeSchematic
+proc schematic {method args} {
+    if {$method eq "NewPagesIter"} {return NULL}
+    return [eval [linsert $args 0 nativeSchematic $method]]
+}
+array set ::visibleNumbers {page1 31 page2 32}
+::PageAutoAnnotate::RunAll
+::PageAutoAnnotate::RunPageNumbers
+if {$::visibleNumbers(page1) != 31 || $::visibleNumbers(page2) != 32 ||
+    $::references(part1) ne "R201" || $::references(part2) ne "R101"} {
+    error "Enumeration failure did not stop before writes"
+}
+rename schematic {}
+rename nativeSchematic schematic
+rename page2 nativePage2
+proc page2 {method args} {
+    if {$method eq "NewPartInstsIter"} {return ""}
+    return [eval [linsert $args 0 nativePage2 $method]]
+}
+::PageAutoAnnotate::RunCurrent
+::PageAutoAnnotate::RunAll
+if {$::references(part1) ne "R201" || $::references(part2) ne "R101"} {
+    error "A missing part iterator did not stop reannotation"
+}
+rename page2 {}
+rename nativePage2 page2
+puts "PASS: both page and placed-part enumeration failures block writes"
+
+array set ::visibleNumbers {page1 1 page2 2}
+set ::occurrenceMode 0
+array set ::references {part1 R5 part2 R5}
+set before $::referenceWrites
+::PageAutoAnnotate::RunAll
+if {$::referenceWrites != $before || [string first R5 $::lastDialog] < 0} {
+    error "Distinct single-section parts sharing R5 were not rejected before any writes"
+}
+
+array set ::packageFor {part1 dualPackage part2 dualPackage}
+array set ::unit {part1 A part2 B}
+foreach original {{U1 U1} {U1A U1B}} expected {{U101 U101} {U101A U101B}} {
+    array set ::references [list part1 [lindex $original 0] part2 [lindex $original 1]]
+    ::PageAutoAnnotate::RunCurrent
+    if {[list $::references(part1) $::references(part2)] ne $expected} {
+        error "Current-page reannotation of $original produced [list $::references(part1) $::references(part2)]: $::lastDialog"
+    }
+    ::PageAutoAnnotate::RunAll
+    if {[list $::references(part1) $::references(part2)] ne $expected} {
+        error "Repeating design reannotation changed a verified package reference"
+    }
+}
+
+set ::occurrenceMode 1
+array set ::references {part1 U2 part2 U2}
+array set ::occurrenceReferences {occ1 U1A occ2 U1B}
+::PageAutoAnnotate::RunAll
+if {[list $::references(part1) $::references(part2) $::occurrenceReferences(occ1) $::occurrenceReferences(occ2)]
+    ne {U101 U101 U101A U101B}} {
+    error "Occurrence suffixes were not preserved independently"
+}
+set ::occurrenceMode 0
+
+foreach spec {
+    {U1A U1A A A dualPackage}
+    {U1A U1B A B otherDualPackage}
+    {U1Z U1B A B dualPackage}
+    {U? U? A B dualPackage}
+} {
+    foreach {refA refB unitA unitB pkgB} $spec break
+    array set ::references [list part1 $refA part2 $refB]
+    array set ::unit [list part1 $unitA part2 $unitB]
+    set ::packageFor(part2) $pkgB
+    set before $::referenceWrites
+    ::PageAutoAnnotate::RunCurrent
+    if {$::referenceWrites != $before || [string first "No changes were made" $::lastDialog] < 0} {
+        error "Ambiguous multi-unit reference reached the write phase: $spec"
+    }
+}
+puts "PASS: package and section verification keeps cross-page units together, preserves suffixes, and stops conflicting references"
+
+array set ::partsByPage {page1 {part1 part2} page2 {}}
+array set ::packageFor {part1 singlePackage part2 singlePackage}
+array set ::references {part1 R? part2 R?}
+::PageAutoAnnotate::RunCurrent
+if {[lsort [list $::references(part1) $::references(part2)]] ne {R101 R102}} {
+    error "Two confirmed single-unit R? parts on one page were not both numbered"
+}
+array set ::references {part1 TP101A part2 TP?}
+::PageAutoAnnotate::RunCurrent
+if {$::references(part1) ne "TP101A" || $::references(part2) ne "TP102" ||
+    [string first "Skipped references: 1" $::lastDialog] < 0 ||
+    [string first TP101A $::lastDialog] < 0} {
+    error "A preserved suffix should reserve its number and be reported without stopping other parts"
+}
+array set ::references {part1 R? part2 R?}
+set ::packageFor(part1) NULL
+::PageAutoAnnotate::RunAll
+if {$::references(part1) ne "R?" || $::references(part2) ne "R101" ||
+    [string first "Package size could not be verified" $::lastDialog] < 0} {
+    error "An unreadable package should preserve only the unnumbered part"
+}
+set ::partsByPage(page1) part1
+set before $::referenceWrites
+::PageAutoAnnotate::RunAll
+if {$::referenceWrites != $before || [string first "No references were changed" $::lastDialog] < 0 ||
+    [string first "Skipped references: 1" $::lastDialog] < 0} {
+    error "All-skipped design should report that no references were changed"
+}
+array set ::partsByPage {page1 part1 page2 part2}
+puts "PASS: unnumbered single units get distinct references; preserved references are reported and their numbers reserved"
+
+rename ::TitleBlockSync::PromptDialog ::TitleBlockSync::NativePromptDialog
+proc ::TitleBlockSync::PromptDialog {} {
+    if {[::TitleBlockSync::PromptProjectName] ne ""} {error "Re-entry started a second project dialog"}
+    return "project"
+}
+if {[::TitleBlockSync::PromptProjectName] ne "project" || $::TitleBlockSync::DialogOpen} {
+    error "Prompt did not prevent re-entry or release its guard"
+}
+rename ::TitleBlockSync::PromptDialog {}
+rename ::TitleBlockSync::NativePromptDialog ::TitleBlockSync::PromptDialog
+
+unset ::IterDefs_SCHEMATICS
+if {![catch {::QuickToolsDbo::SchematicMode} why] || [string first "schematic database iterator is unavailable" $why] < 0} {
+    error "Missing Capture dependency lacked a diagnostic"
+}
+set ::IterDefs_SCHEMATICS 1
+puts "PASS: project dialog re-entry and missing database API diagnostics"
 
 ::QuickToolsHelp::AddAccessoryMenus
 if {[llength $::accessoryMenus] != 14} {

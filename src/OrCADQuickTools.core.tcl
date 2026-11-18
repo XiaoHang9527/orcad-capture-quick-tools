@@ -13,12 +13,141 @@
 # Alt+S: open native Signals navigation for one selected scalar wire.
 
 package require Tcl 8.4
-catch {package require DboTclWriteBasic 16.3.0}
+set ::QuickToolsDboLoadFailed [catch {package require DboTclWriteBasic 16.3.0} ::QuickToolsDboLoadResult]
 
 namespace eval ::OrCADQuickTools {
     variable ScriptDirectory [file dirname [info script]]
     if {![info exists RegisteredActions]} {variable RegisteredActions; array set RegisteredActions {}}
     if {![info exists MenuEventsRegistered]} {variable MenuEventsRegistered 0}
+}
+
+proc ::OrCADQuickTools::TempDirectory {} {
+    foreach name {TMP TEMP USERPROFILE} {
+        if {[info exists ::env($name)] && $::env($name) ne "" &&
+            [file isdirectory $::env($name)] && [file writable $::env($name)]} {
+            return [file normalize $::env($name)]
+        }
+    }
+    return ""
+}
+
+proc ::OrCADQuickTools::TempPath {name} {
+    set directory [TempDirectory]
+    if {$directory eq ""} {return ""}
+    return [file join $directory $name]
+}
+
+proc ::OrCADQuickTools::PreferencePath {name} {
+    if {[info exists ::env(LOCALAPPDATA)] && $::env(LOCALAPPDATA) ne ""} {
+        return [file join $::env(LOCALAPPDATA) OrCADQuickTools $name]
+    }
+    return [TempPath [file join OrCADQuickTools $name]]
+}
+
+# Read-only Capture calls. Fresh DboState objects distinguish an empty
+# iterator from a failed read, even on interfaces that do not reset status.
+namespace eval ::QuickToolsDbo {}
+proc ::QuickToolsDbo::Null {object} {expr {$object eq "" || $object eq "NULL"}}
+proc ::QuickToolsDbo::SchematicMode {} {
+    if {![info exists ::IterDefs_SCHEMATICS]} {
+        set detail ""
+        if {$::QuickToolsDboLoadFailed} {set detail "\nDboTclWriteBasic: $::QuickToolsDboLoadResult"}
+        error "Capture's schematic database iterator is unavailable. Run this command in OrCAD Capture with a design open.$detail"
+    }
+    return $::IterDefs_SCHEMATICS
+}
+proc ::QuickToolsDbo::Check {state stage} {
+    if {![$state Succeeded]} {error "$stage failed (Capture status [$state Code])."}
+}
+proc ::QuickToolsDbo::Next {iterator method} {
+    set state [DboState]
+    set code [catch {
+        set object [$iterator $method $state]
+        # Success can accompany an empty result. 1022 is the documented end
+        # of iteration, and only valid when no object was returned.
+        if {![$state Succeeded] && !([Null $object] && [$state Code] == 1022)} {
+            Check $state $method
+        }
+    } message]
+    catch {$state -delete}
+    if {$code} {error $message}
+    return $object
+}
+proc ::QuickToolsDbo::Objects {owner create next destroy args} {
+    set iterator ""
+    set state [DboState]
+    set code [catch {
+        set iterator [eval [linsert $args 0 $owner $create $state]]
+        Check $state $create
+        if {[Null $iterator]} {error "$create returned no iterator."}
+        set objects {}
+        array set seen {}
+        for {set object [Next $iterator $next]} {![Null $object]} {set object [Next $iterator $next]} {
+            if {[info exists seen($object)]} {error "$next repeated an object."}
+            set seen($object) 1
+            lappend objects $object
+        }
+    } message]
+    if {![Null $iterator]} {catch {$destroy $iterator}}
+    catch {$state -delete}
+    if {$code} {error $message}
+    return $objects
+}
+proc ::QuickToolsDbo::Read {object method} {
+    set state [DboState]
+    set code [catch {
+        set value [$object $method $state]
+        Check $state $method
+    } message]
+    catch {$state -delete}
+    if {$code} {error $message}
+    return $value
+}
+proc ::QuickToolsDbo::FreeStrings {pointers} {
+    foreach pointer $pointers {
+        if {![Null $pointer]} {catch {DboTclHelper_sDeleteCString $pointer}}
+    }
+}
+proc ::QuickToolsDbo::String {object method args} {
+    set pointers {}
+    set status ""
+    set code [catch {
+        foreach arg $args {lappend pointers [DboTclHelper_sMakeCString $arg]}
+        set value [DboTclHelper_sMakeCString]
+        lappend pointers $value
+        set status [eval [linsert $pointers 0 $object $method]]
+        if {![Null $status] && [namespace which -command $status] ne ""} {Check $status $method}
+        set result [DboTclHelper_sGetConstCharPtr $value]
+    } message]
+    FreeStrings $pointers
+    if {![Null $status] && [namespace which -command $status] ne ""} {catch {$status -delete}}
+    if {$code} {error "$method: $message"}
+    return $result
+}
+proc ::QuickToolsDbo::WriteStrings {object method requiredStatus args} {
+    set pointers {}
+    set status ""
+    set code [catch {
+        foreach arg $args {lappend pointers [DboTclHelper_sMakeCString $arg]}
+        set status [eval [linsert $pointers 0 $object $method]]
+        if {$requiredStatus || (![Null $status] && [namespace which -command $status] ne "")} {
+            if {[Null $status] || ![$status OK]} {error "$method failed."}
+        }
+    } message]
+    FreeStrings $pointers
+    if {![Null $status] && [namespace which -command $status] ne ""} {catch {$status -delete}}
+    if {$code} {error $message}
+}
+proc ::QuickToolsDbo::SchematicPages {design} {
+    set pages {}
+    foreach view [Objects $design NewViewsIter NextView delete_DboLibViewsIter [SchematicMode]] {
+        set schematic [DboViewToDboSchematic $view]
+        if {[Null $schematic]} {error "Cannot read a schematic view."}
+        foreach page [Objects $schematic NewPagesIter NextPage delete_DboSchematicPagesIter] {
+            lappend pages [list $schematic $page]
+        }
+    }
+    return $pages
 }
 
 # =============================================================================
@@ -41,7 +170,7 @@ proc ::OrCADQuickTools::ActionDefinitions {} {
             "::NCValuePrefix::Enabler" "::NCValuePrefix::Remove" "Schematic"] \
         [list "Toggle Selected Off Page Graphics" "Alt+F5" \
             "\u5207\u6362\u6240\u9009\u8DE8\u9875\u7B26\u53F7\u7684\u8F93\u5165/\u8F93\u51FA\u56FE\u5F62\uFF08\u4FDD\u7559\u540D\u79F0\uFF09" \
-            "::QuickToolsHelp::Enabler" "::OrCADQuickTools::ToggleOffPage" "Schematic"] \
+            "::OffPageDirection::Enabler" "::OrCADQuickTools::ToggleOffPage" "Schematic"] \
         [list "Export Selected Part Pin Net Table To Excel" "Alt+F6" \
             "\u5BFC\u51FA\u6240\u9009\u5668\u4EF6\u7684\u5F15\u811A-\u7F51\u7EDC\u8868 (XLSX)" \
             "::SelectedPinNetExport::Enabler" "::SelectedPinNetExport::Run" "Schematic"] \
@@ -79,11 +208,11 @@ namespace eval ::SignalsNavigation {
     if {![info exists Pending]} {variable Pending ""}
     if {![info exists Busy]} {variable Busy 0}
     if {![info exists ServerDirectory]} {
-        variable ServerDirectory [file join $::env(TEMP) OrCADSignalsServer-[pid]-[clock clicks]]
+        variable ServerDirectory [::OrCADQuickTools::TempPath OrCADSignalsServer-[pid]-[clock clicks]]
     }
     if {![info exists ServerStarted]} {variable ServerStarted 0}
     if {![info exists RequestStarted]} {variable RequestStarted 0}
-    variable LogFile [file join $::env(TEMP) OrCADSignalsNavigation.log]
+    variable LogFile [::OrCADQuickTools::TempPath OrCADSignalsNavigation.log]
 }
 
 proc ::SignalsNavigation::Log {message} {
@@ -190,6 +319,7 @@ proc ::SignalsNavigation::StartContext {resultFile} {
     variable ServerStarted
     set helper [file join $::OrCADQuickTools::ScriptDirectory OrCADWheelZoom.exe]
     if {![file exists $helper]} {error "Missing OrCADWheelZoom.exe"}
+    if {$ServerDirectory eq ""} {error "No writable temporary directory for Signals."}
     file mkdir $ServerDirectory
     if {!$ServerStarted} {
         set started [clock clicks -milliseconds]
@@ -306,95 +436,58 @@ proc ::NCValuePrefix::Enabler {} {
     return [::OrCADQuickTools::HasSelectedPart]
 }
 
-proc ::NCValuePrefix::Run {} {
-    variable Prefix
+proc ::NCValuePrefix::Run {} {::NCValuePrefix::Update 1}
 
-    if {[catch {set lSelectedObjects [GetSelectedObjects]} lSelectionError]} {
-        puts "NC prefix: cannot read the current selection: $lSelectionError"
+proc ::NCValuePrefix::Remove {} {::NCValuePrefix::Update 0}
+
+proc ::NCValuePrefix::Update {pAdd} {
+    variable Prefix
+    if {[catch {GetSelectedObjects} lSelectedObjects]} {
+        puts "NC prefix: cannot read the current selection: $lSelectedObjects"
         return
     }
 
     set lUpdated 0
-    set lAlreadyPrefixed 0
-    set lSkipped 0
-    set lFailed 0
-
-    foreach lObject $lSelectedObjects {
-        if {![::OrCADQuickTools::IsPlacedPart $lObject]} {
-            incr lSkipped
-            continue
-        }
-
-        set lOldValueCString [DboTclHelper_sMakeCString]
-        if {[catch {$lObject GetPartValue $lOldValueCString} lReadError]} {
-            incr lFailed
-            continue
-        }
-        set lOldValue [DboTclHelper_sGetConstCharPtr $lOldValueCString]
-
-        set lPrefixLength [string length $Prefix]
-        set lExistingPrefix [string range $lOldValue 0 [expr {$lPrefixLength - 1}]]
-        if {[string equal -nocase $lExistingPrefix $Prefix]} {
-            incr lAlreadyPrefixed
-            continue
-        }
-
-        set lNewValueCString [DboTclHelper_sMakeCString "${Prefix}${lOldValue}"]
-        if {[catch {$lObject SetPartValue $lNewValueCString} lWriteError]} {
-            incr lFailed
-            continue
-        }
-        incr lUpdated
-    }
-
-    catch {Menu "View::Zoom::Redraw"}
-    puts "NC prefix: updated=$lUpdated, already-prefixed=$lAlreadyPrefixed, non-parts-skipped=$lSkipped, failed=$lFailed"
-}
-
-proc ::NCValuePrefix::Remove {} {
-    variable Prefix
-
-    if {[catch {set lSelectedObjects [GetSelectedObjects]} lSelectionError]} {
-        puts "NC prefix removal: cannot read the current selection: $lSelectionError"
-        return
-    }
-
-    set lUpdated 0
-    set lWithoutPrefix 0
+    set lUnchanged 0
     set lSkipped 0
     set lFailed 0
     set lPrefixLength [string length $Prefix]
-
     foreach lObject $lSelectedObjects {
         if {![::OrCADQuickTools::IsPlacedPart $lObject]} {
             incr lSkipped
             continue
         }
-
-        set lOldValueCString [DboTclHelper_sMakeCString]
-        if {[catch {$lObject GetPartValue $lOldValueCString} lReadError]} {
+        if {[catch {::QuickToolsDbo::String $lObject GetPartValue} lOldValue]} {
             incr lFailed
             continue
         }
-        set lOldValue [DboTclHelper_sGetConstCharPtr $lOldValueCString]
-
-        set lExistingPrefix [string range $lOldValue 0 [expr {$lPrefixLength - 1}]]
-        if {![string equal -nocase $lExistingPrefix $Prefix]} {
-            incr lWithoutPrefix
+        set lPrefixed [string equal -nocase [string range $lOldValue 0 [expr {$lPrefixLength - 1}]] $Prefix]
+        if {$lPrefixed == $pAdd} {
+            incr lUnchanged
             continue
         }
-
-        set lNewValue [string range $lOldValue $lPrefixLength end]
-        set lNewValueCString [DboTclHelper_sMakeCString $lNewValue]
-        if {[catch {$lObject SetPartValue $lNewValueCString} lWriteError]} {
+        if {$pAdd} {
+            set lNewValue "$Prefix$lOldValue"
+        } else {
+            set lNewValue [string range $lOldValue $lPrefixLength end]
+        }
+        if {[catch {
+            ::QuickToolsDbo::WriteStrings $lObject SetPartValue 0 $lNewValue
+            if {[::QuickToolsDbo::String $lObject GetPartValue] ne $lNewValue} {error "Value read-back differs."}
+        } lError]} {
             incr lFailed
-            continue
+            puts "NC prefix: $lError"
+        } else {
+            incr lUpdated
         }
-        incr lUpdated
     }
 
     catch {Menu "View::Zoom::Redraw"}
-    puts "NC prefix removal: updated=$lUpdated, without-prefix=$lWithoutPrefix, non-parts-skipped=$lSkipped, failed=$lFailed"
+    puts "NC prefix: updated=$lUpdated, already-correct=$lUnchanged, non-parts-skipped=$lSkipped, failed=$lFailed"
+    if {$lFailed > 0} {
+        catch {tk_messageBox -type ok -icon warning -title "NC Prefix" \
+            -message "Updated: $lUpdated\nAlready correct: $lUnchanged\nSkipped: $lSkipped\nCould not update or verify: $lFailed"}
+    }
 }
 
 # -----------------------------------------------------------------------------
@@ -424,48 +517,34 @@ proc ::PageReferenceFix::SplitReference {pReference pPrefixName pNumberName} {
 }
 
 proc ::PageReferenceFix::GetReference {pPart} {
-    set lPropertyName [DboTclHelper_sMakeCString "Reference"]
-    set lPropertyValue [DboTclHelper_sMakeCString]
-    if {![catch {$pPart GetEffectivePropStringValue $lPropertyName $lPropertyValue}]} {
-        set lVisible [string trim [DboTclHelper_sGetConstCharPtr $lPropertyValue]]
-        if {$lVisible != ""} {return $lVisible}
+    if {![catch {::QuickToolsDbo::String $pPart GetEffectivePropStringValue Reference} lValue] &&
+        [string trim $lValue] ne ""} {
+        return [string trim $lValue]
     }
-    set lReferenceCString [DboTclHelper_sMakeCString]
-    if {[catch {$pPart GetReference $lReferenceCString}]} {
-        return ""
-    }
-    return [DboTclHelper_sGetConstCharPtr $lReferenceCString]
+    if {[catch {::QuickToolsDbo::String $pPart GetReference} lValue]} {return ""}
+    return $lValue
 }
 
 proc ::PageReferenceFix::GetCurrentPageNumber {pPage pStatus} {
-    set lPageNumberName [DboTclHelper_sMakeCString "Page Number"]
-    set lPageNumberValue [DboTclHelper_sMakeCString]
-    if {![catch {set lTitleBlocksIter [$pPage NewTitleBlocksIter $pStatus]}]} {
-        set lTitleBlock [$lTitleBlocksIter NextTitleBlock $pStatus]
-        while {$lTitleBlock != "NULL"} {
-            if {![catch {$lTitleBlock GetEffectivePropStringValue $lPageNumberName $lPageNumberValue}]} {
-                set lCandidate [DboTclHelper_sGetConstCharPtr $lPageNumberValue]
-                if {[string is integer -strict $lCandidate] && $lCandidate > 0} {
-                    catch {delete_DboPageTitleBlocksIter $lTitleBlocksIter}
-                    return $lCandidate
-                }
-            }
-            set lTitleBlock [$lTitleBlocksIter NextTitleBlock $pStatus]
+    foreach lTitleBlock [::QuickToolsDbo::Objects $pPage NewTitleBlocksIter NextTitleBlock delete_DboPageTitleBlocksIter] {
+        if {![catch {::QuickToolsDbo::String $lTitleBlock GetEffectivePropStringValue "Page Number"} lCandidate] &&
+            [string is integer -strict $lCandidate] && $lCandidate > 0} {
+            return $lCandidate
         }
-        catch {delete_DboPageTitleBlocksIter $lTitleBlocksIter}
     }
 
     # The title-block property is the sheet number users see and edit.  The
     # DboPage number can instead be a separate database position.
-    if {![catch {set lPageNumber [$pPage GetPageNumber $pStatus]}]} {
+    if {![catch {
+        set lPageNumber [$pPage GetPageNumber $pStatus]
+        ::QuickToolsDbo::Check $pStatus GetPageNumber
+    }]} {
         if {[string is integer -strict $lPageNumber] && $lPageNumber > 0} {
             return $lPageNumber
         }
     }
 
-    set lPageNameCString [DboTclHelper_sMakeCString]
-    if {![catch {$pPage GetName $lPageNameCString}]} {
-        set lPageName [DboTclHelper_sGetConstCharPtr $lPageNameCString]
+    if {![catch {::QuickToolsDbo::String $pPage GetName} lPageName]} {
         if {[regexp {([0-9]+)$} $lPageName lWhole lCandidate]} {
             if {$lCandidate > 0} {
                 return [expr {int($lCandidate)}]
@@ -475,15 +554,14 @@ proc ::PageReferenceFix::GetCurrentPageNumber {pPage pStatus} {
     return 0
 }
 
-proc ::PageReferenceFix::CollectPageReferences {pPage pStatus pUsedName pMaxName} {
+proc ::PageReferenceFix::CollectPageReferences {pPage pUsedName pMaxName} {
     upvar 1 $pUsedName lUsed
     upvar 1 $pMaxName lMax
 
-    set lPartsIter [$pPage NewPartInstsIter $pStatus]
-    set lPart [$lPartsIter NextPartInst $pStatus]
-    while {$lPart != "NULL"} {
+    foreach lPart [::QuickToolsDbo::Objects $pPage NewPartInstsIter NextPartInst delete_DboPagePartInstsIter] {
         if {[::OrCADQuickTools::IsPlacedPart $lPart]} {
             set lReference [::PageReferenceFix::GetReference $lPart]
+            if {$lReference eq ""} {error "A component on the current page has no readable reference."}
             if {[::PageReferenceFix::SplitReference $lReference lPrefix lNumber]} {
                 set lPrefixKey [string toupper $lPrefix]
                 set lUsed($lPrefixKey,$lNumber) 1
@@ -492,9 +570,7 @@ proc ::PageReferenceFix::CollectPageReferences {pPage pStatus pUsedName pMaxName
                 }
             }
         }
-        set lPart [$lPartsIter NextPartInst $pStatus]
     }
-    catch {delete_DboPagePartInstsIter $lPartsIter}
 }
 
 proc ::PageReferenceFix::FindNextNumber {pPrefixKey pRangeStart pRangeEnd pUsedName pMaxName} {
@@ -531,9 +607,9 @@ proc ::PageReferenceFix::Run {} {
     }
 
     set lStatus [DboState]
-    set lPageNumber [::PageReferenceFix::GetCurrentPageNumber $lPage $lStatus]
-    if {$lPageNumber <= 0} {
-        catch {$lStatus -delete}
+    set lReadFailed [catch {::PageReferenceFix::GetCurrentPageNumber $lPage $lStatus} lPageNumber]
+    catch {$lStatus -delete}
+    if {$lReadFailed || $lPageNumber <= 0} {
         puts "Page reference fix: cannot determine the current page number; no references were changed."
         return
     }
@@ -542,7 +618,10 @@ proc ::PageReferenceFix::Run {} {
     set lRangeEnd [expr {$lPageNumber * $NumbersPerPage + $NumbersPerPage - 1}]
     array set lUsed {}
     array set lMax {}
-    ::PageReferenceFix::CollectPageReferences $lPage $lStatus lUsed lMax
+    if {[catch {::PageReferenceFix::CollectPageReferences $lPage lUsed lMax} lError]} {
+        catch {tk_messageBox -type ok -icon error -title "Page Reference Fix" -message "$lError\nNo references were changed."}
+        return
+    }
 
     set lUpdated 0
     set lAlreadyCorrect 0
@@ -574,21 +653,23 @@ proc ::PageReferenceFix::Run {} {
         }
 
         set lNewReference "${lPrefix}${lNewNumber}"
-        set lNewReferenceCString [DboTclHelper_sMakeCString $lNewReference]
-        if {[catch {$lObject SetReference $lNewReferenceCString} lWriteError]} {
+        set lUsed($lPrefixKey,$lNewNumber) 1
+        if {[catch {::PageAutoAnnotate::SetReference $lObject $lNewReference} lOK] || !$lOK} {
             incr lFailed
             continue
         }
 
-        set lUsed($lPrefixKey,$lNewNumber) 1
         set lMax($lPrefixKey) $lNewNumber
         incr lUpdated
         puts "Page reference fix: $lOldReference -> $lNewReference"
     }
 
-    catch {$lStatus -delete}
     catch {Menu "View::Zoom::Redraw"}
     puts "Page reference fix: page=$lPageNumber, range=$lRangeStart-$lRangeEnd, updated=$lUpdated, already-correct=$lAlreadyCorrect, skipped=$lSkipped, failed=$lFailed"
+    if {$lFailed > 0} {
+        catch {tk_messageBox -type ok -icon warning -title "Page Reference Fix" \
+            -message "Updated: $lUpdated\nAlready correct: $lAlreadyCorrect\nSkipped: $lSkipped\nCould not update or verify: $lFailed"}
+    }
 }
 
 # -----------------------------------------------------------------------------
@@ -598,6 +679,7 @@ proc ::PageReferenceFix::Run {} {
 namespace eval ::TitleBlockSync {
     variable ProjectName ""
     variable DialogResult ""
+    if {![info exists Busy]} {variable Busy 0}
 }
 
 proc ::TitleBlockSync::Enabler {} {
@@ -616,11 +698,8 @@ proc ::TitleBlockSync::GetActiveDesign {} {
 }
 
 proc ::TitleBlockSync::GetObjectString {pObject pMethod} {
-    set lValueCString [DboTclHelper_sMakeCString]
-    if {[catch {$pObject $pMethod $lValueCString}]} {
-        return ""
-    }
-    return [DboTclHelper_sGetConstCharPtr $lValueCString]
+    if {[catch {::QuickToolsDbo::String $pObject $pMethod} lValue]} {return ""}
+    return $lValue
 }
 
 proc ::TitleBlockSync::GetCurrentDoc {} {
@@ -630,30 +709,27 @@ proc ::TitleBlockSync::GetCurrentDoc {} {
         return ""
     }
 
-    set lStatus [DboState]
-    set lTitleBlocksIter "NULL"
-    if {[catch {set lTitleBlocksIter [$lPage NewTitleBlocksIter $lStatus]}] ||
-        $lTitleBlocksIter == "NULL" || $lTitleBlocksIter == ""} {
-        catch {$lStatus -delete}
-        return ""
+    if {![catch {::QuickToolsDbo::Objects $lPage NewTitleBlocksIter NextTitleBlock delete_DboPageTitleBlocksIter} lBlocks] &&
+        [llength $lBlocks] && ![catch {::QuickToolsDbo::String [lindex $lBlocks 0] GetEffectivePropStringValue Doc} lDoc]} {
+        return $lDoc
     }
-
-    set lResult ""
-    set lTitleBlock [$lTitleBlocksIter NextTitleBlock $lStatus]
-    if {$lTitleBlock != "NULL" && $lTitleBlock != ""} {
-        set lPropName [DboTclHelper_sMakeCString "Doc"]
-        set lPropValue [DboTclHelper_sMakeCString]
-        if {![catch {$lTitleBlock GetEffectivePropStringValue $lPropName $lPropValue}]} {
-            set lResult [DboTclHelper_sGetConstCharPtr $lPropValue]
-        }
-    }
-
-    catch {delete_DboPageTitleBlocksIter $lTitleBlocksIter}
-    catch {$lStatus -delete}
-    return $lResult
+    return ""
 }
 
 proc ::TitleBlockSync::PromptProjectName {} {
+    variable DialogOpen
+    if {[info exists DialogOpen] && $DialogOpen} {return ""}
+    set DialogOpen 1
+    set lCode [catch {PromptDialog} lResult]
+    set DialogOpen 0
+    if {$lCode} {
+        catch {destroy .orcadTitleBlockSync}
+        error $lResult
+    }
+    return $lResult
+}
+
+proc ::TitleBlockSync::PromptDialog {} {
     variable ProjectName
     variable DialogResult
 
@@ -661,7 +737,6 @@ proc ::TitleBlockSync::PromptProjectName {} {
         puts "Title block sync: Tk is unavailable: $lTkError"
         return ""
     }
-    catch {wm withdraw .}
 
     set ProjectName [::TitleBlockSync::GetCurrentDoc]
     set DialogResult ""
@@ -697,6 +772,9 @@ proc ::TitleBlockSync::PromptProjectName {} {
     bind $lWindow <Escape> {
         set ::TitleBlockSync::DialogResult cancel
     }
+    bind $lWindow <Destroy> {
+        if {%W eq ".orcadTitleBlockSync"} {set ::TitleBlockSync::DialogResult cancel}
+    }
     focus $lWindow.project
     $lWindow.project selection range 0 end
     catch {grab set $lWindow}
@@ -713,21 +791,22 @@ proc ::TitleBlockSync::PromptProjectName {} {
 }
 
 proc ::TitleBlockSync::WriteProperty {pObject pName pValue} {
-    set lNameCString [DboTclHelper_sMakeCString $pName]
-    set lValueCString [DboTclHelper_sMakeCString $pValue]
-    if {[catch {set lWriteStatus [$pObject SetEffectivePropStringValue $lNameCString $lValueCString]}]} {
-        return 0
-    }
-    if {$lWriteStatus == "NULL" || $lWriteStatus == ""} {
-        return 0
-    }
-    if {[catch {set lOK [$lWriteStatus OK]}] || !$lOK} {
-        return 0
-    }
-    return 1
+    return [expr {![catch {::QuickToolsDbo::WriteStrings $pObject SetEffectivePropStringValue 1 $pName $pValue}]}]
 }
 
 proc ::TitleBlockSync::Run {} {
+    variable Busy
+    if {$Busy} {return}
+    set Busy 1
+    set lCode [catch {::TitleBlockSync::Execute} lMessage]
+    set Busy 0
+    if {$lCode} {
+        catch {destroy .orcadTitleBlockSync}
+        catch {tk_messageBox -type ok -icon error -title "Title Block Sync" -message $lMessage}
+    }
+}
+
+proc ::TitleBlockSync::Execute {} {
     set lDesign [::TitleBlockSync::GetActiveDesign]
     if {$lDesign == "NULL" || $lDesign == ""} {
         catch {tk_messageBox -type ok -icon warning -title "Title Block Sync" \
@@ -750,72 +829,28 @@ proc ::TitleBlockSync::Run {} {
         return
     }
 
-    set lStatus [DboState]
     set lPageCount 0
-    set lTitleBlockCount 0
-    set lUpdatedCount 0
     set lPageWithoutTitleBlockCount 0
+    set lPlan {}
+    foreach lPageRecord [::QuickToolsDbo::SchematicPages $lDesign] {
+        set lPage [lindex $lPageRecord 1]
+        set lPageName [::QuickToolsDbo::String $lPage GetName]
+        if {$lPageName eq ""} {error "A schematic page has no readable name."}
+        incr lPageCount
+        set lBlocks [::QuickToolsDbo::Objects $lPage NewTitleBlocksIter NextTitleBlock delete_DboPageTitleBlocksIter]
+        if {![llength $lBlocks]} {incr lPageWithoutTitleBlockCount}
+        foreach lBlock $lBlocks {lappend lPlan [list $lBlock $lPageName]}
+    }
+    set lTitleBlockCount [llength $lPlan]
+    set lUpdatedCount 0
     set lFailedPropertyCount 0
-
-    set lViewsIter "NULL"
-    if {[catch {set lViewsIter [$lDesign NewViewsIter $lStatus $::IterDefs_SCHEMATICS]} lViewError] ||
-        $lViewsIter == "NULL" || $lViewsIter == ""} {
-        catch {$lStatus -delete}
-        catch {tk_messageBox -type ok -icon error -title "Title Block Sync" \
-            -message "The schematic pages could not be read.\n\n$lViewError"}
-        puts "Title block sync: cannot create schematic iterator: $lViewError"
-        return
+    foreach lItem $lPlan {
+        foreach {lBlock lPageName} $lItem break
+        set lDocOK [::TitleBlockSync::WriteProperty $lBlock Doc $lProjectName]
+        set lTitleOK [::TitleBlockSync::WriteProperty $lBlock Title $lPageName]
+        if {$lDocOK && $lTitleOK} {incr lUpdatedCount}
+        incr lFailedPropertyCount [expr {!$lDocOK + !$lTitleOK}]
     }
-
-    set lView [$lViewsIter NextView $lStatus]
-    while {$lView != "NULL" && $lView != ""} {
-        set lSchematic "NULL"
-        catch {set lSchematic [DboViewToDboSchematic $lView]}
-        if {$lSchematic != "NULL" && $lSchematic != ""} {
-            set lPagesIter "NULL"
-            if {![catch {set lPagesIter [$lSchematic NewPagesIter $lStatus]}] &&
-                $lPagesIter != "NULL" && $lPagesIter != ""} {
-                set lPage [$lPagesIter NextPage $lStatus]
-                while {$lPage != "NULL" && $lPage != ""} {
-                    incr lPageCount
-                    set lPageName [::TitleBlockSync::GetObjectString $lPage "GetName"]
-                    set lPageTitleBlockCount 0
-                    set lTitleBlocksIter "NULL"
-                    if {![catch {set lTitleBlocksIter [$lPage NewTitleBlocksIter $lStatus]}] &&
-                        $lTitleBlocksIter != "NULL" && $lTitleBlocksIter != ""} {
-                        set lTitleBlock [$lTitleBlocksIter NextTitleBlock $lStatus]
-                        while {$lTitleBlock != "NULL" && $lTitleBlock != ""} {
-                            incr lPageTitleBlockCount
-                            incr lTitleBlockCount
-                            set lDocOK [::TitleBlockSync::WriteProperty $lTitleBlock "Doc" $lProjectName]
-                            set lTitleOK [::TitleBlockSync::WriteProperty $lTitleBlock "Title" $lPageName]
-                            if {$lDocOK && $lTitleOK} {
-                                incr lUpdatedCount
-                            } else {
-                                if {!$lDocOK} {
-                                    incr lFailedPropertyCount
-                                }
-                                if {!$lTitleOK} {
-                                    incr lFailedPropertyCount
-                                }
-                            }
-                            set lTitleBlock [$lTitleBlocksIter NextTitleBlock $lStatus]
-                        }
-                        catch {delete_DboPageTitleBlocksIter $lTitleBlocksIter}
-                    }
-                    if {$lPageTitleBlockCount == 0} {
-                        incr lPageWithoutTitleBlockCount
-                    }
-                    set lPage [$lPagesIter NextPage $lStatus]
-                }
-                catch {delete_DboSchematicPagesIter $lPagesIter}
-            }
-        }
-        set lView [$lViewsIter NextView $lStatus]
-    }
-
-    catch {delete_DboLibViewsIter $lViewsIter}
-    catch {$lStatus -delete}
     catch {Menu "View::Zoom::Redraw"}
 
     if {$lTitleBlockCount == 0} {
@@ -851,6 +886,103 @@ proc ::PageAutoAnnotate::GetPrefix {pReference} {
         return [string toupper [string trim $lPrefix]]
     }
     return ""
+}
+
+proc ::PageAutoAnnotate::ReferenceForm {reference} {
+    if {[regexp {^([^0-9?]+[0-9]+)([A-Za-z]*)$} $reference -> base suffix]} {
+        return [list $base $suffix 1]
+    }
+    if {[regexp {^[^0-9?]+\??$} $reference]} {return [list $reference "" 0]}
+    error "Unsupported reference format: $reference"
+}
+
+# Capture's physical-view exporter uses the cached package size and section
+# designator. Cache/package identity alone cannot distinguish two copies.
+proc ::PageAutoAnnotate::PartPackage {part} {
+    set placed [DboPartInstToDboPlacedInst $part]
+    if {[::QuickToolsDbo::Null $placed]} {error "Placed component is unavailable."}
+    set package [::QuickToolsDbo::Read $placed GetPackage]
+    if {[::QuickToolsDbo::Null $package]} {error "Cached package is unavailable."}
+    set size [::QuickToolsDbo::Read $package GetSize]
+    if {![string is integer -strict $size] || $size < 1} {error "Cached package size is unavailable."}
+    return [list $placed $package $size]
+}
+
+proc ::PageAutoAnnotate::PackageMember {part occurrence {packageInfo {}}} {
+    if {$packageInfo eq ""} {set packageInfo [PartPackage $part]}
+    foreach {placed package size} $packageInfo break
+    if {$size <= 1} {error "The package has no separate units."}
+    set unit [string trim [::QuickToolsDbo::String $placed GetDeviceDesignator]]
+    if {$unit eq ""} {error "The package unit is unavailable."}
+    if {![::QuickToolsDbo::Null $occurrence]} {
+        set occurrenceUnit [string trim [::QuickToolsDbo::String $occurrence GetDesignator]]
+        if {![string equal -nocase $unit $occurrenceUnit]} {
+            error "Instance and occurrence unit designators disagree."
+        }
+    }
+    return [list $package $size [string toupper $unit]]
+}
+
+proc ::PageAutoAnnotate::ConfirmGroup {records skipName} {
+    upvar 1 $skipName skip
+    set skip ""
+    set members {}
+    set package ""
+    array set usedUnits {}
+    set groupSize [llength $records]
+    foreach record $records {
+        set suffixes {}
+        foreach original [lrange $record 7 8] {
+            if {$original ne ""} {
+                lappend suffixes [lindex [ReferenceForm $original] 1]
+            }
+        }
+        set identity {}
+        set effective [lindex $record 8]
+        if {$effective eq ""} {set effective [lindex $record 7]}
+        set part [lindex $record 0]
+        if {![lindex [ReferenceForm $effective] 2]} {
+            if {[catch {PartPackage $part} packageInfo]} {
+                set skip "Package size could not be verified for the unnumbered part: $packageInfo"
+                return $records
+            }
+            if {[lindex $packageInfo 2] > 1} {
+                error "A multi-unit component needs a package reference before reannotation."
+            }
+        }
+        if {$groupSize > 1 || [join $suffixes {}] ne ""} {
+            set packageInfo [PartPackage $part]
+            if {$groupSize == 1 && [lindex $packageInfo 2] == 1} {
+                set skip "Single-unit reference with a letter suffix; preserved as entered."
+                return $records
+            }
+            set identity [PackageMember $part [lindex $record 6] $packageInfo]
+            foreach {cache size unit} $identity break
+            if {$package ne "" && $cache ne $package} {error "The reference is used by different cached packages."}
+            if {[info exists usedUnits($unit)]} {error "Unit $unit occurs more than once."}
+            foreach suffix $suffixes {
+                if {$suffix ne "" && ![string equal -nocase $unit $suffix]} {
+                    error "Reference suffix $suffix does not match package unit $unit."
+                }
+            }
+            set package $cache
+            set usedUnits($unit) 1
+            if {[array size usedUnits] > $size} {error "More units share the reference than the package defines."}
+        }
+        lappend members [linsert $record end $identity]
+    }
+    return $members
+}
+
+proc ::PageAutoAnnotate::CheckGroupMember {record} {
+    set expected [lindex $record 9]
+    if {$expected ne "" && [PackageMember [lindex $record 0] [lindex $record 6]] ne $expected} {
+        error "Package unit changed on [lindex $record 2] ([lindex $record 7])."
+    }
+}
+
+proc ::PageAutoAnnotate::ReferenceTarget {base original} {
+    return "$base[lindex [ReferenceForm $original] 1]"
 }
 
 proc ::PageAutoAnnotate::GetCoordinates {pPart pStatus} {
@@ -958,12 +1090,7 @@ proc ::PageAutoAnnotate::CompareBucketKeys {pLeft pRight} {
 }
 
 proc ::PageAutoAnnotate::ReadReferenceProperty {pObject} {
-    set lName [DboTclHelper_sMakeCString "Reference"]
-    set lValue [DboTclHelper_sMakeCString]
-    if {[catch {$pObject GetEffectivePropStringValue $lName $lValue}]} {
-        return [list 0 ""]
-    }
-    if {[catch {set lText [DboTclHelper_sGetConstCharPtr $lValue]}]} {
+    if {[catch {::QuickToolsDbo::String $pObject GetEffectivePropStringValue Reference} lText]} {
         return [list 0 ""]
     }
     return [list 1 [string trim $lText]]
@@ -993,48 +1120,44 @@ proc ::PageAutoAnnotate::CollectPartOccurrences {pDesign pStatus pOccurrencesNam
         return "The design occurrences could not be read."
     }
     set lError ""
-    if {[catch {set lOccurrence [quickToolsOccurrencesIter NextOccurrence $pStatus]}]} {
-        set lError "The first design occurrence could not be read."
-    }
-    while {$lError == "" && $lOccurrence != "NULL" && $lOccurrence != ""} {
-        set lPart "NULL"
-        catch {set lPart [$lOccurrence GetPartInst $pStatus]}
-        if {$lPart != "NULL" && $lPart != "" && [::OrCADQuickTools::IsPlacedPart $lPart]} {
-            if {[info exists lOccurrences($lPart)]} {
-                set lError "A component has multiple occurrences; no changes were made."
-                break
+    if {[catch {
+        array set lSeen {}
+        while {1} {
+            set lOccurrence [::QuickToolsDbo::Next quickToolsOccurrencesIter NextOccurrence]
+            if {[::QuickToolsDbo::Null $lOccurrence]} {break}
+            if {[info exists lSeen($lOccurrence)]} {error "The occurrence iterator repeated an object."}
+            set lSeen($lOccurrence) 1
+            set lPart [$lOccurrence GetPartInst $pStatus]
+            if {![::QuickToolsDbo::Null $lPart]} {
+                ::QuickToolsDbo::Check $pStatus GetPartInst
+                if {[::OrCADQuickTools::IsPlacedPart $lPart]} {
+                    if {[info exists lOccurrences($lPart)]} {
+                        error "A component has multiple occurrences."
+                    }
+                    set lOccurrences($lPart) $lOccurrence
+                }
             }
-            set lOccurrences($lPart) $lOccurrence
         }
-        if {[catch {set lOccurrence [quickToolsOccurrencesIter NextOccurrence $pStatus]}]} {
-            set lError "A design occurrence could not be read."
-        }
+    } lReadError]} {
+        set lError "The design occurrences could not be read: $lReadError"
     }
     catch {rename quickToolsOccurrencesIter {}}
     return $lError
 }
 
-proc ::PageAutoAnnotate::SetReference {pPart pReference} {
-    set lReferenceCString [DboTclHelper_sMakeCString $pReference]
-    if {[catch {set lWriteStatus [$pPart SetReference $lReferenceCString]}]} {
-        return 0
-    }
-    if {$lWriteStatus == "NULL" || $lWriteStatus == ""} {
-        return 0
-    }
-    if {[catch {set lOK [$lWriteStatus OK]}] || !$lOK} {
-        return 0
-    }
+proc ::PageAutoAnnotate::SetReference {pPart pReference {pExpected ""}} {
+    if {$pExpected eq ""} {set pExpected $pReference}
+    if {[catch {::QuickToolsDbo::WriteStrings $pPart SetReference 1 $pReference}]} {return 0}
     set lVisible [::PageAutoAnnotate::ReadReferenceProperty $pPart]
-    if {![lindex $lVisible 0] || ![string equal -nocase [lindex $lVisible 1] $pReference]} {
-        if {![::TitleBlockSync::WriteProperty $pPart "Reference" $pReference]} {
-            puts "Reference property write failed: $pReference"
+    if {![lindex $lVisible 0] || ![string equal -nocase [lindex $lVisible 1] $pExpected]} {
+        if {![::TitleBlockSync::WriteProperty $pPart "Reference" $pExpected]} {
+            puts "Reference property write failed: $pExpected"
             return 0
         }
         set lVisible [::PageAutoAnnotate::ReadReferenceProperty $pPart]
     }
-    if {![lindex $lVisible 0] || ![string equal -nocase [lindex $lVisible 1] $pReference]} {
-        puts "Reference property read-back failed: target=$pReference, actual=[lindex $lVisible 1]"
+    if {![lindex $lVisible 0] || ![string equal -nocase [lindex $lVisible 1] $pExpected]} {
+        puts "Reference property read-back failed: target=$pExpected, actual=[lindex $lVisible 1]"
         return 0
     }
     return 1
@@ -1043,89 +1166,71 @@ proc ::PageAutoAnnotate::SetReference {pPart pReference} {
 proc ::PageAutoAnnotate::ApplyReferenceToGroup {pRecords pReference} {
     foreach lRecord $pRecords {
         set lPart [lindex $lRecord 0]
-        if {![::PageAutoAnnotate::SetReference $lPart $pReference]} {
+        if {![SetReference $lPart $pReference [ReferenceTarget $pReference [lindex $lRecord 7]]]} {
             return 0
         }
         set lOccurrence [lindex $lRecord 6]
         if {$lOccurrence != "" && $lOccurrence != "NULL" &&
-            ![::PageAutoAnnotate::SetReference $lOccurrence $pReference]} {
+            ![SetReference $lOccurrence $pReference [ReferenceTarget $pReference [lindex $lRecord 8]]]} {
             return 0
         }
+        CheckGroupMember $lRecord
     }
     return 1
 }
 
 proc ::PageAutoAnnotate::ReadTitleProperty {pTitleBlock pName} {
-    set lName [DboTclHelper_sMakeCString $pName]
-    set lValue [DboTclHelper_sMakeCString]
-    if {[catch {$pTitleBlock GetEffectivePropStringValue $lName $lValue}]} {
-        return [list 0 ""]
-    }
-    if {[catch {set lText [DboTclHelper_sGetConstCharPtr $lValue]}]} {
+    if {[catch {::QuickToolsDbo::String $pTitleBlock GetEffectivePropStringValue $pName} lText]} {
         return [list 0 ""]
     }
     return [list 1 [string trim $lText]]
 }
 
-proc ::PageAutoAnnotate::ReadPageTitleBlocks {pPage pStatus} {
-    set lTitleBlocksIter "NULL"
-    if {[catch {set lTitleBlocksIter [$pPage NewTitleBlocksIter $pStatus]}] ||
-        $lTitleBlocksIter == "NULL" || $lTitleBlocksIter == ""} {
-        return {}
-    }
-
+proc ::PageAutoAnnotate::ReadPageTitleBlocks {pPage} {
     set lRecords {}
-    set lTitleBlock [$lTitleBlocksIter NextTitleBlock $pStatus]
-    while {$lTitleBlock != "NULL" && $lTitleBlock != ""} {
+    foreach lTitleBlock [::QuickToolsDbo::Objects $pPage NewTitleBlocksIter NextTitleBlock delete_DboPageTitleBlocksIter] {
         set lOldVisibleNumber [::PageAutoAnnotate::ReadTitleProperty $lTitleBlock "Page Number"]
         set lOldVisibleCount [::PageAutoAnnotate::ReadTitleProperty $lTitleBlock "Page Count"]
         lappend lRecords [list $lTitleBlock $lOldVisibleNumber $lOldVisibleCount]
-        set lTitleBlock [$lTitleBlocksIter NextTitleBlock $pStatus]
     }
-    catch {delete_DboPageTitleBlocksIter $lTitleBlocksIter}
     return $lRecords
 }
 
-proc ::PageAutoAnnotate::ApplyPageNumbers {pPagePlan pPageCount} {
+proc ::PageAutoAnnotate::ApplyPageNumbers {pPagePlan pPageCount pJournalName} {
+    upvar 1 $pJournalName lJournal
     foreach lPageRecord $pPagePlan {
         set lNumber [lindex $lPageRecord 3]
+        set lPageName [lindex $lPageRecord 2]
         foreach lTitleRecord [lindex $lPageRecord 5] {
             set lTitleBlock [lindex $lTitleRecord 0]
-            if {![::TitleBlockSync::WriteProperty $lTitleBlock "Page Number" $lNumber] ||
-                ![::TitleBlockSync::WriteProperty $lTitleBlock "Page Count" $pPageCount]} {
-                return "Could not update visible title-block page properties on [lindex $lPageRecord 2]."
+            foreach {lProperty lValue lOldIndex} [list "Page Number" $lNumber 1 "Page Count" $pPageCount 2] {
+                lappend lJournal [list $lTitleBlock $lProperty [lindex [lindex $lTitleRecord $lOldIndex] 1]]
+                if {![::TitleBlockSync::WriteProperty $lTitleBlock $lProperty $lValue]} {
+                    error "Could not update $lProperty on $lPageName."
+                }
             }
             set lVisibleNumber [::PageAutoAnnotate::ReadTitleProperty $lTitleBlock "Page Number"]
             set lVisibleCount [::PageAutoAnnotate::ReadTitleProperty $lTitleBlock "Page Count"]
             if {![lindex $lVisibleNumber 0] || [lindex $lVisibleNumber 1] != $lNumber ||
                 ![lindex $lVisibleCount 0] || [lindex $lVisibleCount 1] != $pPageCount} {
-                return "Title-block Page Number / Page Count did not change on [lindex $lPageRecord 2] (read back: [lindex $lVisibleNumber 1] / [lindex $lVisibleCount 1])."
+                error "Title-block Page Number / Page Count did not change on $lPageName (read back: [lindex $lVisibleNumber 1] / [lindex $lVisibleCount 1])."
             }
-            puts "Page numbering verified: [lindex $lPageRecord 2] -> $lNumber / $pPageCount"
+            catch {puts "Page numbering verified: $lPageName -> $lNumber / $pPageCount"}
         }
     }
-    return ""
 }
 
-proc ::PageAutoAnnotate::RestorePageNumbers {pPagePlan} {
+proc ::PageAutoAnnotate::RestorePageNumbers {pJournal} {
     set lFailures 0
-    foreach lPageRecord $pPagePlan {
-        foreach lTitleRecord [lindex $lPageRecord 5] {
-            set lTitleBlock [lindex $lTitleRecord 0]
-            foreach {lProperty lOldVisible} [list "Page Number" [lindex $lTitleRecord 1] "Page Count" [lindex $lTitleRecord 2]] {
-                if {[lindex $lOldVisible 0]} {
-                    if {![::TitleBlockSync::WriteProperty $lTitleBlock $lProperty [lindex $lOldVisible 1]]} {
-                        incr lFailures
-                    } else {
-                        set lRestored [::PageAutoAnnotate::ReadTitleProperty $lTitleBlock $lProperty]
-                        if {![lindex $lRestored 0] ||
-                            ![string equal [lindex $lRestored 1] [lindex $lOldVisible 1]]} {
-                            incr lFailures
-                        }
-                    }
-                }
+    for {set i [expr {[llength $pJournal] - 1}]} {$i >= 0} {incr i -1} {
+        foreach {lTitleBlock lProperty lOriginal} [lindex $pJournal $i] break
+        if {[catch {
+            if {![::TitleBlockSync::WriteProperty $lTitleBlock $lProperty $lOriginal]} {error "Write failed."}
+            set lRestored [::PageAutoAnnotate::ReadTitleProperty $lTitleBlock $lProperty]
+            if {![lindex $lRestored 0] || ![string equal [lindex $lRestored 1] $lOriginal]} {
+                error "Read-back failed."
             }
-        }
+        }]} {incr lFailures}
     }
     return $lFailures
 }
@@ -1176,8 +1281,7 @@ proc ::PageAutoAnnotate::ComparePageRecords {pLeft pRight} {
     return [::PageAutoAnnotate::CompareNaturalPageNames [lindex $pLeft 2] [lindex $pRight 2]]
 }
 
-proc ::PageAutoAnnotate::ResolveNamedPageOrder {pPagePlan pRecordsName pInvalidPagesName} {
-    upvar 1 $pRecordsName lGroupRecords
+proc ::PageAutoAnnotate::ResolveNamedPageOrder {pPagePlan pInvalidPagesName} {
     upvar 1 $pInvalidPagesName lInvalidPages
 
     foreach lPageRecord $pPagePlan {
@@ -1202,26 +1306,15 @@ proc ::PageAutoAnnotate::ResolveNamedPageOrder {pPagePlan pRecordsName pInvalidP
     if {[llength $lInvalidPages] > 0} {return {}}
 
     set lOrderedPlan {}
-    array set lPageNumbers {}
     set lNewNumber 0
     foreach lPageRecord $lSortable {
         incr lNewNumber
-        set lPage [lindex $lPageRecord 1]
-        set lPageNumbers($lPage) $lNewNumber
         lappend lOrderedPlan [lreplace $lPageRecord 3 3 $lNewNumber]
-    }
-    foreach lGroupKey [array names lGroupRecords] {
-        set lUpdatedRecords {}
-        foreach lRecord $lGroupRecords($lGroupKey) {
-            set lPage [lindex $lRecord 5]
-            lappend lUpdatedRecords [lreplace $lRecord 1 1 $lPageNumbers($lPage)]
-        }
-        set lGroupRecords($lGroupKey) $lUpdatedRecords
     }
     return $lOrderedPlan
 }
 
-proc ::PageAutoAnnotate::CollectDesign {pDesign pStatus pMode pRecordsName pPrefixName pOldReferenceName pOrderName pExistingName pPagesName pInvalidPagesName pPagePlanName pStatsName} {
+proc ::PageAutoAnnotate::CollectDesign {pDesign pStatus pMode pRecordsName pPrefixName pOldReferenceName pOrderName pExistingName pPagesName pInvalidPagesName pSkippedGroupsName pStatsName} {
     upvar 1 $pRecordsName lGroupRecords
     upvar 1 $pPrefixName lGroupPrefix
     upvar 1 $pOldReferenceName lGroupOldReference
@@ -1229,7 +1322,7 @@ proc ::PageAutoAnnotate::CollectDesign {pDesign pStatus pMode pRecordsName pPref
     upvar 1 $pExistingName lExistingOwners
     upvar 1 $pPagesName lPageOccurrences
     upvar 1 $pInvalidPagesName lInvalidPages
-    upvar 1 $pPagePlanName lPagePlan
+    upvar 1 $pSkippedGroupsName lSkippedGroups
     upvar 1 $pStatsName lStats
 
     array set lGroupRecords {}
@@ -1237,9 +1330,9 @@ proc ::PageAutoAnnotate::CollectDesign {pDesign pStatus pMode pRecordsName pPref
     array set lGroupOldReference {}
     array set lExistingOwners {}
     array set lPageOccurrences {}
+    array set lSkippedGroups {}
     set lGroupOrder {}
     set lInvalidPages {}
-    set lPagePlan {}
     set lPageCount 0
     set lPartCount 0
     set lSkippedCount 0
@@ -1253,97 +1346,74 @@ proc ::PageAutoAnnotate::CollectDesign {pDesign pStatus pMode pRecordsName pPref
     }
     set lOccurrenceMode [expr {[array size lPartOccurrences] > 0}]
 
-    set lViewsIter "NULL"
-    if {[catch {set lViewsIter [$pDesign NewViewsIter $pStatus $::IterDefs_SCHEMATICS]}] ||
-        $lViewsIter == "NULL" || $lViewsIter == ""} {
-        set lStats [list 0 0 0]
-        return 0
-    }
-
-    set lView [$lViewsIter NextView $pStatus]
-    while {$lView != "NULL" && $lView != ""} {
-        set lSchematic "NULL"
-        catch {set lSchematic [DboViewToDboSchematic $lView]}
-        if {$lSchematic != "NULL" && $lSchematic != ""} {
-            set lPagesIter "NULL"
-            if {![catch {set lPagesIter [$lSchematic NewPagesIter $pStatus]}] &&
-                $lPagesIter != "NULL" && $lPagesIter != ""} {
-                set lPage [$lPagesIter NextPage $pStatus]
-                while {$lPage != "NULL" && $lPage != ""} {
-                    incr lPageCount
-                    set lPageName [::TitleBlockSync::GetObjectString $lPage "GetName"]
-                    set lPageNumber [::PageReferenceFix::GetCurrentPageNumber $lPage $pStatus]
-                    if {$lPageNumber <= 0} {
-                        lappend lInvalidPages $lPageName
-                    } else {
-                        lappend lPageOccurrences($lPageNumber) $lPageName
-                    }
-
-                    set lPartsIter "NULL"
-                    if {![catch {set lPartsIter [$lPage NewPartInstsIter $pStatus]}] &&
-                        $lPartsIter != "NULL" && $lPartsIter != ""} {
-                        set lPart [$lPartsIter NextPartInst $pStatus]
-                        while {$lPart != "NULL" && $lPart != ""} {
-                            if {[::OrCADQuickTools::IsPlacedPart $lPart]} {
-                                set lPartReference [::PageReferenceFix::GetReference $lPart]
-                                set lOccurrence ""
-                                set lOccurrenceReference ""
-                                if {[info exists lPartOccurrences($lPart)]} {
-                                    set lOccurrence $lPartOccurrences($lPart)
-                                    set lOccurrenceValue [::PageAutoAnnotate::ReadReferenceProperty $lOccurrence]
-                                    if {![lindex $lOccurrenceValue 0] || [lindex $lOccurrenceValue 1] == ""} {
-                                        lappend lInvalidPages "$lPageName (occurrence reference unavailable)"
-                                    } else {
-                                        set lOccurrenceReference [lindex $lOccurrenceValue 1]
-                                    }
-                                } elseif {$lOccurrenceMode} {
-                                    lappend lInvalidPages "$lPageName (component occurrence missing)"
-                                }
-                                if {$lOccurrenceReference != ""} {
-                                    set lOldReference $lOccurrenceReference
-                                } else {
-                                    set lOldReference $lPartReference
-                                }
-                                set lPrefix [::PageAutoAnnotate::GetPrefix $lOldReference]
-                                if {$lPrefix != ""} {
-                                    foreach {lX lY} [::PageAutoAnnotate::GetCoordinates $lPart $pStatus] break
-                                    set lReferenceKey [list $lPrefix [string toupper $lOldReference]]
-                                    if {[regexp {^[^0-9?]+[0-9]+$} $lOldReference]} {
-                                        set lGroupKey $lReferenceKey
-                                    } else {
-                                        set lGroupKey [list $lPrefix [string toupper $lOldReference] $lPart]
-                                    }
-                                    if {![info exists lGroupRecords($lGroupKey)]} {
-                                        set lGroupRecords($lGroupKey) {}
-                                        set lGroupPrefix($lGroupKey) $lPrefix
-                                        set lGroupOldReference($lGroupKey) $lOldReference
-                                        lappend lGroupOrder $lGroupKey
-                                    }
-                                    lappend lGroupRecords($lGroupKey) [list $lPart $lPageNumber $lPageName $lX $lY $lPage $lOccurrence $lPartReference $lOccurrenceReference]
-                                    lappend lExistingOwners($lReferenceKey) $lGroupKey
-                                    incr lPartCount
-                                } else {
-                                    incr lSkippedCount
-                                }
-                            } else {
-                                incr lSkippedCount
-                            }
-                            set lPart [$lPartsIter NextPartInst $pStatus]
-                        }
-                        catch {delete_DboPagePartInstsIter $lPartsIter}
-                    }
-                    set lPage [$lPagesIter NextPage $pStatus]
-                }
-                catch {delete_DboSchematicPagesIter $lPagesIter}
-            } elseif {$pMode == "all"} {
-                catch {delete_DboLibViewsIter $lViewsIter}
-                set lStats [list $lPageCount $lPartCount $lSkippedCount]
-                return 0
-            }
+    foreach lPageRecord [::QuickToolsDbo::SchematicPages $pDesign] {
+        set lPage [lindex $lPageRecord 1]
+        incr lPageCount
+        set lPageName [::TitleBlockSync::GetObjectString $lPage GetName]
+        if {$lPageName eq ""} {error "A schematic page has no readable name."}
+        set lPageNumber [::PageReferenceFix::GetCurrentPageNumber $lPage $pStatus]
+        if {$lPageNumber <= 0} {
+            lappend lInvalidPages "$lPageName (Page Number unavailable)"
+        } else {
+            lappend lPageOccurrences($lPageNumber) $lPageName
         }
-        set lView [$lViewsIter NextView $pStatus]
+        if {[catch {::QuickToolsDbo::Objects $lPage NewPartInstsIter NextPartInst delete_DboPagePartInstsIter} lParts]} {
+            error "$lPageName: $lParts"
+        }
+        foreach lPart $lParts {
+            if {![::OrCADQuickTools::IsPlacedPart $lPart]} {
+                incr lSkippedCount
+                continue
+            }
+            set lPartReference [::PageReferenceFix::GetReference $lPart]
+            if {$lPartReference eq ""} {error "$lPageName (component reference unavailable)"}
+            set lOccurrence ""
+            set lOccurrenceReference ""
+            if {[info exists lPartOccurrences($lPart)]} {
+                set lOccurrence $lPartOccurrences($lPart)
+                set lOccurrenceValue [::PageAutoAnnotate::ReadReferenceProperty $lOccurrence]
+                if {![lindex $lOccurrenceValue 0] || [lindex $lOccurrenceValue 1] eq ""} {
+                    error "$lPageName (occurrence reference unavailable for $lPartReference)"
+                }
+                set lOccurrenceReference [lindex $lOccurrenceValue 1]
+            } elseif {$lOccurrenceMode} {
+                error "$lPageName (component occurrence missing for $lPartReference)"
+            }
+            set lOldReference $lPartReference
+            if {$lOccurrenceReference ne ""} {set lOldReference $lOccurrenceReference}
+            if {[catch {
+                foreach {lBase lSuffix lAssigned} [ReferenceForm $lOldReference] break
+                set lInstanceBase [lindex [ReferenceForm $lPartReference] 0]
+            } lError]} {error "$lPageName: $lError"}
+            set lPrefix [GetPrefix $lBase]
+            set lReferenceKey [list $lPrefix [string toupper $lBase]]
+            set lGroupKey $lReferenceKey
+            if {!$lAssigned} {lappend lGroupKey $lPart}
+            if {![info exists lGroupRecords($lGroupKey)]} {
+                set lGroupPrefix($lGroupKey) $lPrefix
+                set lGroupOldReference($lGroupKey) $lBase
+                lappend lGroupOrder $lGroupKey
+            }
+            foreach {lX lY} [GetCoordinates $lPart $pStatus] break
+            lappend lGroupRecords($lGroupKey) [list $lPart $lPageNumber $lPageName $lX $lY $lPage $lOccurrence $lPartReference $lOccurrenceReference]
+            lappend lExistingOwners($lReferenceKey) $lGroupKey
+            set lInstanceKey [list [GetPrefix $lInstanceBase] [string toupper $lInstanceBase]]
+            if {$lInstanceKey ne $lReferenceKey} {lappend lExistingOwners($lInstanceKey) $lGroupKey}
+            incr lPartCount
+        }
     }
-    catch {delete_DboLibViewsIter $lViewsIter}
+    foreach key $lGroupOrder {
+        if {[catch {ConfirmGroup $lGroupRecords($key) skipReason} members]} {
+            set pageNames {}
+            foreach record $lGroupRecords($key) {lappend pageNames [lindex $record 2]}
+            set pages [join [lsort -unique $pageNames] { / }]
+            lappend lInvalidPages "$lGroupOldReference($key) on $pages: $members"
+        } elseif {$skipReason ne ""} {
+            set lSkippedGroups($key) $skipReason
+        } else {
+            set lGroupRecords($key) $members
+        }
+    }
     set lStats [list $lPageCount $lPartCount $lSkippedCount]
     if {$pMode == "all" && $lPageCount == 0} {
         return 0
@@ -1362,20 +1432,40 @@ proc ::PageAutoAnnotate::RestoreOriginalReferences {pPlan pRecordsName} {
     foreach lItem $pPlan {
         set lGroupKey [lindex $lItem 0]
         foreach lRecord $lGroupRecords($lGroupKey) {
-            if {![::PageAutoAnnotate::SetReference [lindex $lRecord 0] [lindex $lRecord 7]]} {
+            set lOld [lindex $lRecord 7]
+            if {[catch {SetReference [lindex $lRecord 0] [lindex [ReferenceForm $lOld] 0] $lOld} lOK] || !$lOK} {
                 incr lFailures
             }
             set lOccurrence [lindex $lRecord 6]
+            set lOld [lindex $lRecord 8]
             if {$lOccurrence != "" && $lOccurrence != "NULL" &&
-                ![::PageAutoAnnotate::SetReference $lOccurrence [lindex $lRecord 8]]} {
+                ([catch {SetReference $lOccurrence [lindex [ReferenceForm $lOld] 0] $lOld} lOK] || !$lOK)} {
                 incr lFailures
             }
+            if {[catch {CheckGroupMember $lRecord}]} {incr lFailures}
         }
     }
     return $lFailures
 }
 
 proc ::PageAutoAnnotate::Run {pMode} {
+    variable Busy
+    if {[info exists Busy] && $Busy} {return}
+    set Busy 1
+    set title "Reference Reannotation"
+    set code [catch {
+        if {$pMode eq "pages"} {
+            set title "Page Number Reset"
+            ResetPageNumbers
+        } else {
+            Reannotate $pMode
+        }
+    } message]
+    set Busy 0
+    if {$code} {catch {tk_messageBox -type ok -icon error -title $title -message $message}}
+}
+
+proc ::PageAutoAnnotate::Reannotate {pMode} {
     set lDesign [::TitleBlockSync::GetActiveDesign]
     if {$lDesign == "NULL" || $lDesign == ""} {
         catch {tk_messageBox -type ok -icon warning -title "Reference Reannotation" \
@@ -1397,8 +1487,8 @@ proc ::PageAutoAnnotate::Run {pMode} {
     set lCurrentPageNumber 0
     if {$pMode == "current"} {
         set lCurrentPageName [::TitleBlockSync::GetObjectString $lCurrentPage "GetName"]
-        set lCurrentPageNumber [::PageReferenceFix::GetCurrentPageNumber $lCurrentPage $lStatus]
-        if {$lCurrentPageNumber <= 0} {
+        if {[catch {::PageReferenceFix::GetCurrentPageNumber $lCurrentPage $lStatus} lCurrentPageNumber] ||
+            $lCurrentPageNumber <= 0} {
             catch {$lStatus -delete}
             catch {tk_messageBox -type ok -icon error -title "Reference Reannotation" \
                 -message "The current page number could not be determined."}
@@ -1411,15 +1501,17 @@ proc ::PageAutoAnnotate::Run {pMode} {
     array set lGroupOldReference {}
     array set lExistingOwners {}
     array set lPageOccurrences {}
+    array set lSkippedGroups {}
     set lGroupOrder {}
     set lInvalidPages {}
-    set lPagePlan {}
     set lStats {}
-    if {![::PageAutoAnnotate::CollectDesign $lDesign $lStatus $pMode \
+    set lReadCode [catch {::PageAutoAnnotate::CollectDesign $lDesign $lStatus $pMode \
         lGroupRecords lGroupPrefix lGroupOldReference lGroupOrder \
-        lExistingOwners lPageOccurrences lInvalidPages lPagePlan lStats]} {
+        lExistingOwners lPageOccurrences lInvalidPages lSkippedGroups lStats} lReadResult]
+    if {$lReadCode || !$lReadResult} {
         catch {$lStatus -delete}
         set lDetail [join $lInvalidPages {, }]
+        if {$lReadCode} {set lDetail $lReadResult}
         if {$lDetail == ""} {set lDetail "The schematic pages could not be read."}
         catch {tk_messageBox -type ok -icon error -title "Reference Reannotation" \
             -message "$lDetail\n\nNo changes were made."}
@@ -1436,6 +1528,7 @@ proc ::PageAutoAnnotate::Run {pMode} {
     array set lBuckets {}
     array set lSelectedGroups {}
     array set lAnchorPageName {}
+    set lSkippedInScope {}
     foreach lGroupKey $lGroupOrder {
         set lAnchor ""
         foreach lRecord $lGroupRecords($lGroupKey) {
@@ -1458,6 +1551,13 @@ proc ::PageAutoAnnotate::Run {pMode} {
             }
         }
         if {$lAnchor != ""} {
+            if {[info exists lSkippedGroups($lGroupKey)]} {
+                set lRecord [lindex $lGroupRecords($lGroupKey) 0]
+                set lRef [lindex $lRecord 8]
+                if {$lRef eq ""} {set lRef [lindex $lRecord 7]}
+                lappend lSkippedInScope "[lindex $lAnchor 1] / $lRef: $lSkippedGroups($lGroupKey)"
+                continue
+            }
             set lSelectedGroups($lGroupKey) 1
             set lPageNumber [lindex $lAnchor 0]
             set lPageName [lindex $lAnchor 1]
@@ -1468,30 +1568,59 @@ proc ::PageAutoAnnotate::Run {pMode} {
         }
     }
 
-    if {[array size lSelectedGroups] == 0 && $pMode != "all"} {
+    set lSkipSummary ""
+    if {[llength $lSkippedInScope]} {
+        foreach lSkipped $lSkippedInScope {puts "Reference reannotation skipped: $lSkipped"}
+        set lSkipSummary "\nSkipped references: [llength $lSkippedInScope]\n[join [lrange $lSkippedInScope 0 4] \n]"
+        if {[llength $lSkippedInScope] > 5} {append lSkipSummary "\nSee Command Window for the full list."}
+    }
+    if {[array size lSelectedGroups] == 0} {
         catch {$lStatus -delete}
         catch {tk_messageBox -type ok -icon warning -title "Reference Reannotation" \
-            -message "No annotatable components were found in the selected scope."}
+            -message "No references were changed in the selected scope.$lSkipSummary"}
         return
     }
 
+    # Reserve the base numbers of preserved references, including their
+    # instance/occurrence aliases, until all planned writes have finished.
+    array set lReservedTargets {}
+    if {[array size lSkippedGroups]} {
+        foreach lExisting [array names lExistingOwners] {
+            foreach lOwner $lExistingOwners($lExisting) {
+                if {[info exists lSkippedGroups($lOwner)]} {
+                    set lReservedTargets($lExisting) 1
+                    break
+                }
+            }
+        }
+    }
     set lPlan {}
     set lPlanError ""
     foreach lBucketKey [lsort -command ::PageAutoAnnotate::CompareBucketKeys [array names lBuckets]] {
         set lPageNumber [lindex $lBucketKey 0]
         set lPrefix [lindex $lBucketKey 1]
         set lSorted [::PageAutoAnnotate::SortSpatial $lBuckets($lBucketKey)]
-        if {[llength $lSorted] > 99} {
-            set lPlanError "Page $lPageNumber has more than 99 $lPrefix references."
+        set lMaxPerPrefix [expr {$::PageReferenceFix::NumbersPerPage - 1}]
+        if {[llength $lSorted] > $lMaxPerPrefix} {
+            set lPlanError "Page $lPageNumber has more than $lMaxPerPrefix $lPrefix references."
             break
         }
         set lSequence 1
         foreach lSpatialRecord $lSorted {
             set lGroupKey [lindex $lSpatialRecord 0]
-            set lNewReference "${lPrefix}[expr {$lPageNumber * 100 + $lSequence}]"
+            while {$lSequence <= $lMaxPerPrefix} {
+                set lNewReference "${lPrefix}[expr {$lPageNumber * $::PageReferenceFix::NumbersPerPage + $lSequence}]"
+                if {![info exists lReservedTargets([list $lPrefix $lNewReference])]} {break}
+                incr lSequence
+            }
+            if {$lSequence > $lMaxPerPrefix} {
+                set lPlanError "Page $lPageNumber has insufficient free $lPrefix references after accounting for preserved references."
+                break
+            }
             lappend lPlan [list $lGroupKey $lGroupOldReference($lGroupKey) $lNewReference $lPrefix $lPageNumber $lAnchorPageName($lGroupKey)]
             incr lSequence
         }
+        if {$lPlanError ne ""} {break}
     }
     if {$lPlanError != ""} {
         catch {$lStatus -delete}
@@ -1534,21 +1663,20 @@ proc ::PageAutoAnnotate::Run {pMode} {
     if {$pMode == "all"} {
         set lScopeText "ALL schematic pages"
         set lWarningText "This will reset all component references in the active design using each title block's existing Page Number. Page Number and Page Count will not be changed."
-        set lPagePreview ""
     } else {
         set lScopeText "current page $lCurrentPageNumber ($lCurrentPageName)"
         set lWarningText "This will reset all component references on the current page. Linked multi-part units retain one shared reference."
-        set lPagePreview ""
     }
     if {$pMode == "all"} {
         set lScopePageCount [lindex $lStats 0]
     } else {
         set lScopePageCount 1
     }
+    set lSkippedCount [lindex $lStats 2]
     set lConfirmation "cancel"
     catch {set lConfirmation [tk_messageBox -type okcancel -default cancel -icon warning \
         -title "Reference Reannotation" \
-        -message "$lWarningText\n\nScope: $lScopeText\nPages: $lScopePageCount\nReferences: [llength $lPlan]\nPlaced units: $lObjectCount\nComponent order: left to right, then top to bottom$lPagePreview\n\nPlease make sure the design is backed up before continuing."]}
+        -message "$lWarningText\n\nScope: $lScopeText\nPages: $lScopePageCount\nReferences to update: [llength $lPlan]\nPlaced units: $lObjectCount\nNon-annotatable objects in design: $lSkippedCount$lSkipSummary\nComponent order: left to right, then top to bottom\n\nPlease make sure the design is backed up before continuing."]}
     if {$lConfirmation != "ok"} {
         catch {$lStatus -delete}
         puts "Reference reannotation: cancelled."
@@ -1572,56 +1700,54 @@ proc ::PageAutoAnnotate::Run {pMode} {
         set lTemporaryReferences($lGroupKey) $lTemporaryReference
     }
 
-    set lOperationError ""
-    set lReferencesStarted 0
-    if {$lOperationError == ""} {
+    catch {$lStatus -delete}
+    set lAttempted {}
+    set lFinalPhase 0
+    if {[catch {
         foreach lItem $lPlan {
-            set lReferencesStarted 1
             set lGroupKey [lindex $lItem 0]
+            lappend lAttempted $lItem
             if {![::PageAutoAnnotate::ApplyReferenceToGroup $lGroupRecords($lGroupKey) $lTemporaryReferences($lGroupKey)]} {
-                set lOperationError "Failed while assigning temporary references."
-                break
+                error "Failed while assigning temporary references."
             }
         }
-    }
-    if {$lOperationError == ""} {
+        set lFinalPhase 1
         foreach lItem $lPlan {
             set lGroupKey [lindex $lItem 0]
             set lNewReference [lindex $lItem 2]
             if {![::PageAutoAnnotate::ApplyReferenceToGroup $lGroupRecords($lGroupKey) $lNewReference]} {
-                set lOperationError "Failed while assigning $lNewReference."
-                break
+                error "Failed while assigning $lNewReference."
             }
         }
-    }
-    if {$lOperationError == ""} {
         foreach lItem $lPlan {
             set lTarget [lindex $lItem 2]
             foreach lRecord $lGroupRecords([lindex $lItem 0]) {
                 set lPartValue [::PageAutoAnnotate::ReadReferenceProperty [lindex $lRecord 0]]
-                if {![lindex $lPartValue 0] || ![string equal -nocase [lindex $lPartValue 1] $lTarget]} {
-                    set lOperationError "Reference read-back failed on [lindex $lRecord 2]: expected $lTarget, instance shows [lindex $lPartValue 1]."
-                    break
+                set lExpected [ReferenceTarget $lTarget [lindex $lRecord 7]]
+                if {![lindex $lPartValue 0] || ![string equal -nocase [lindex $lPartValue 1] $lExpected]} {
+                    error "Reference read-back failed on [lindex $lRecord 2]: expected $lExpected, instance shows [lindex $lPartValue 1]."
                 }
                 set lOccurrence [lindex $lRecord 6]
                 if {$lOccurrence != "" && $lOccurrence != "NULL"} {
                     set lVisibleValue [::PageAutoAnnotate::ReadReferenceProperty $lOccurrence]
-                    if {![lindex $lVisibleValue 0] || ![string equal -nocase [lindex $lVisibleValue 1] $lTarget]} {
-                        set lOperationError "Reference read-back failed on [lindex $lRecord 2]: expected $lTarget, occurrence shows [lindex $lVisibleValue 1]."
-                        break
+                    set lExpected [ReferenceTarget $lTarget [lindex $lRecord 8]]
+                    if {![lindex $lVisibleValue 0] || ![string equal -nocase [lindex $lVisibleValue 1] $lExpected]} {
+                        error "Reference read-back failed on [lindex $lRecord 2]: expected $lExpected, occurrence shows [lindex $lVisibleValue 1]."
                     }
                 }
+                CheckGroupMember $lRecord
             }
-            if {$lOperationError != ""} {break}
         }
-    }
-
-    if {$lOperationError != ""} {
-        set lRestoreFailures 0
-        if {$lReferencesStarted} {
-            incr lRestoreFailures [::PageAutoAnnotate::RestoreOriginalReferences $lPlan lGroupRecords]
+    } lOperationError]} {
+        # Free original refdes before restoration if final writes had begun.
+        # Continue the restore even when one temporary write fails.
+        if {$lFinalPhase} {
+            foreach lItem $lAttempted {
+                set lGroupKey [lindex $lItem 0]
+                catch {::PageAutoAnnotate::ApplyReferenceToGroup $lGroupRecords($lGroupKey) $lTemporaryReferences($lGroupKey)}
+            }
         }
-        catch {$lStatus -delete}
+        set lRestoreFailures [::PageAutoAnnotate::RestoreOriginalReferences $lAttempted lGroupRecords]
         catch {Menu "View::Zoom::Redraw"}
         catch {tk_messageBox -type ok -icon error -title "Reference Reannotation" \
             -message "$lOperationError\n\nThe script attempted to restore the original references.\nRestore failures: $lRestoreFailures"}
@@ -1629,11 +1755,9 @@ proc ::PageAutoAnnotate::Run {pMode} {
         return
     }
 
-    catch {$lStatus -delete}
     catch {Menu "View::Zoom::Redraw"}
-    set lPageResult ""
     catch {tk_messageBox -type ok -icon info -title "Reference Reannotation" \
-        -message "Reannotation complete.\n\nScope: $lScopeText\n${lPageResult}References updated: [llength $lPlan]\nPlaced units: $lObjectCount\n\nPlease inspect and save the design."}
+        -message "Reannotation complete.\n\nScope: $lScopeText\nReferences updated: [llength $lPlan]\nPlaced units: $lObjectCount\nNon-annotatable objects in design: $lSkippedCount$lSkipSummary\n\nPlease inspect and save the design."}
     puts "Reference reannotation complete: mode=$pMode, pages=$lScopePageCount, references=[llength $lPlan], placed-units=$lObjectCount"
 }
 
@@ -1646,6 +1770,10 @@ proc ::PageAutoAnnotate::RunAll {} {
 }
 
 proc ::PageAutoAnnotate::RunPageNumbers {} {
+    ::PageAutoAnnotate::Run pages
+}
+
+proc ::PageAutoAnnotate::ResetPageNumbers {} {
     set lDesign [::TitleBlockSync::GetActiveDesign]
     if {$lDesign == "NULL" || $lDesign == ""} {
         catch {tk_messageBox -type ok -icon warning -title "Page Number Reset" \
@@ -1653,57 +1781,33 @@ proc ::PageAutoAnnotate::RunPageNumbers {} {
         return
     }
 
-    set lStatus [DboState]
     set lPagePlan {}
     set lInvalidPages {}
-    set lViewsIter "NULL"
-    if {[catch {set lViewsIter [$lDesign NewViewsIter $lStatus $::IterDefs_SCHEMATICS]}] ||
-        $lViewsIter == "NULL" || $lViewsIter == ""} {
-        catch {$lStatus -delete}
-        catch {tk_messageBox -type ok -icon error -title "Page Number Reset" \
-            -message "The schematic pages could not be read. No changes were made."}
-        return
-    }
-
-    set lView [$lViewsIter NextView $lStatus]
-    while {$lView != "NULL" && $lView != ""} {
-        set lSchematic "NULL"
-        catch {set lSchematic [DboViewToDboSchematic $lView]}
-        if {$lSchematic != "NULL" && $lSchematic != ""} {
-            set lPagesIter "NULL"
-            if {![catch {set lPagesIter [$lSchematic NewPagesIter $lStatus]}] &&
-                $lPagesIter != "NULL" && $lPagesIter != ""} {
-                set lPage [$lPagesIter NextPage $lStatus]
-                while {$lPage != "NULL" && $lPage != ""} {
-                    set lPageName [::TitleBlockSync::GetObjectString $lPage "GetName"]
-                    set lTitleRecords [::PageAutoAnnotate::ReadPageTitleBlocks $lPage $lStatus]
-                    if {[llength $lTitleRecords] == 0} {
-                        lappend lInvalidPages "$lPageName (no title block)"
-                    }
-                    foreach lTitleRecord $lTitleRecords {
-                        if {![lindex [lindex $lTitleRecord 1] 0] ||
-                            ![lindex [lindex $lTitleRecord 2] 0]} {
-                            lappend lInvalidPages "$lPageName (visible title-block properties unavailable)"
-                            break
-                        }
-                    }
-                    lappend lPagePlan [list $lSchematic $lPage $lPageName 0 0 $lTitleRecords]
-                    set lPage [$lPagesIter NextPage $lStatus]
-                }
-                catch {delete_DboSchematicPagesIter $lPagesIter}
+    if {[catch {
+        foreach lPageRecord [::QuickToolsDbo::SchematicPages $lDesign] {
+            foreach {lSchematic lPage} $lPageRecord break
+            set lPageName [::TitleBlockSync::GetObjectString $lPage GetName]
+            if {[catch {::PageAutoAnnotate::ReadPageTitleBlocks $lPage} lTitleRecords]} {
+                error "$lPageName: $lTitleRecords"
             }
+            if {![llength $lTitleRecords]} {
+                lappend lInvalidPages "$lPageName (no title block)"
+            }
+            foreach lTitleRecord $lTitleRecords {
+                if {![lindex [lindex $lTitleRecord 1] 0] || ![lindex [lindex $lTitleRecord 2] 0]} {
+                    lappend lInvalidPages "$lPageName (visible title-block properties unavailable)"
+                    break
+                }
+            }
+            lappend lPagePlan [list $lSchematic $lPage $lPageName 0 0 $lTitleRecords]
         }
-        set lView [$lViewsIter NextView $lStatus]
-    }
-    catch {delete_DboLibViewsIter $lViewsIter}
+    } lReadError]} {lappend lInvalidPages $lReadError}
 
-    array set lNoComponentRecords {}
     if {[llength $lInvalidPages] == 0} {
         set lPagePlan [::PageAutoAnnotate::ResolveNamedPageOrder \
-            $lPagePlan lNoComponentRecords lInvalidPages]
+            $lPagePlan lInvalidPages]
     }
     if {[llength $lPagePlan] == 0 || [llength $lInvalidPages] > 0} {
-        catch {$lStatus -delete}
         set lDetail [join $lInvalidPages {, }]
         if {$lDetail == ""} {set lDetail "No schematic pages were found."}
         catch {tk_messageBox -type ok -icon error -title "Page Number Reset" \
@@ -1726,15 +1830,13 @@ proc ::PageAutoAnnotate::RunPageNumbers {} {
         -title "Page Number Reset" \
         -message "This will reset Page Number and Page Count only. Component references will not be changed.\n\nPages: [llength $lPagePlan]\nNew page order:$lPreview\n\nPlease make sure the design is backed up before continuing."]}
     if {$lConfirmation != "ok"} {
-        catch {$lStatus -delete}
         puts "Page number reset: cancelled."
         return
     }
 
-    set lError [::PageAutoAnnotate::ApplyPageNumbers $lPagePlan [llength $lPagePlan]]
-    if {$lError != ""} {
-        set lRestoreFailures [::PageAutoAnnotate::RestorePageNumbers $lPagePlan]
-        catch {$lStatus -delete}
+    set lJournal {}
+    if {[catch {::PageAutoAnnotate::ApplyPageNumbers $lPagePlan [llength $lPagePlan] lJournal} lError]} {
+        set lRestoreFailures [::PageAutoAnnotate::RestorePageNumbers $lJournal]
         catch {Menu "View::Zoom::Redraw"}
         catch {tk_messageBox -type ok -icon error -title "Page Number Reset" \
             -message "$lError\n\nThe script attempted to restore the original page properties.\nRestore failures: $lRestoreFailures"}
@@ -1742,7 +1844,6 @@ proc ::PageAutoAnnotate::RunPageNumbers {} {
         return
     }
 
-    catch {$lStatus -delete}
     catch {Menu "View::Zoom::Redraw"}
     catch {tk_messageBox -type ok -icon info -title "Page Number Reset" \
         -message "Page number reset complete.\n\nPages updated: [llength $lPagePlan]\nComponent references were not changed.\n\nPlease inspect and save the design."}
@@ -1756,54 +1857,14 @@ proc ::PageAutoAnnotate::RunPageNumbers {} {
 # external process.
 # -----------------------------------------------------------------------------
 
-namespace eval ::SelectedPinNetExport {}
+namespace eval ::SelectedPinNetExport {
+    if {![info exists Busy]} {variable Busy 0}
+}
 
 proc ::SelectedPinNetExport::Enabler {} {
     return [::OrCADQuickTools::HasSelectedPart]
 }
 
-proc ::SelectedPinNetExport::EscapeCSV {pValue} {
-    set lEscaped [string map [list "\"" "\"\""] $pValue]
-    return "\"$lEscaped\""
-}
-
-proc ::SelectedPinNetExport::GetObjectString {pObject pMethod} {
-    set lValueCString [DboTclHelper_sMakeCString]
-    if {[catch {$pObject $pMethod $lValueCString}]} {
-        return ""
-    }
-    return [DboTclHelper_sGetConstCharPtr $lValueCString]
-}
-
-proc ::SelectedPinNetExport::GetPageName {pPage} {
-    if {$pPage == "NULL" || $pPage == ""} {
-        return ""
-    }
-    return [::SelectedPinNetExport::GetObjectString $pPage "GetName"]
-}
-
-proc ::SelectedPinNetExport::GetNetName {pPin pStatus} {
-    set lNet "NULL"
-    catch {set lNet [$pPin GetNet $pStatus]}
-    if {$lNet != "NULL" && $lNet != ""} {
-        set lNetName [::SelectedPinNetExport::GetObjectString $lNet "GetNetName"]
-        if {$lNetName != ""} {
-            return $lNetName
-        }
-    }
-
-    # A wire can carry the resolved name in older Capture 16.6 designs even
-    # when DboPortInst::GetNet does not return a net object.
-    set lWire "NULL"
-    catch {set lWire [$pPin GetWire $pStatus]}
-    if {$lWire != "NULL" && $lWire != ""} {
-        set lNetName [::SelectedPinNetExport::GetObjectString $lWire "GetNetName"]
-        if {$lNetName != ""} {
-            return $lNetName
-        }
-    }
-    return ""
-}
 
 proc ::SelectedPinNetExport::GetDefaultLocation {} {
     set lDirectory [pwd]
@@ -1812,7 +1873,7 @@ proc ::SelectedPinNetExport::GetDefaultLocation {} {
     set lDesign "NULL"
     catch {set lDesign [GetActivePMDesign]}
     if {$lDesign != "NULL" && $lDesign != ""} {
-        set lDesignName [::SelectedPinNetExport::GetObjectString $lDesign "GetName"]
+        set lDesignName [::TitleBlockSync::GetObjectString $lDesign "GetName"]
         if {$lDesignName != ""} {
             set lCandidateDirectory [file dirname $lDesignName]
             if {[file isdirectory $lCandidateDirectory]} {
@@ -1835,7 +1896,6 @@ proc ::SelectedPinNetExport::ChooseOutputFile {} {
     if {[catch {package require Tk}]} {
         return [file join $lInitialDirectory $lInitialFile]
     }
-    catch {wm withdraw .}
     set lOutputFile [tk_getSaveFile \
         -title "Export Selected Part Pin-Net Table" \
         -initialdir $lInitialDirectory \
@@ -1846,111 +1906,66 @@ proc ::SelectedPinNetExport::ChooseOutputFile {} {
 }
 
 proc ::SelectedPinNetExport::Run {} {
-
-    if {![llength [info commands ::OrCADPinNetXlsx::WriteWorkbook]]} {
-        error "The embedded XLSX module is missing; reload the complete OrCADQuickTools.tcl."
+    variable Busy
+    if {$Busy} {return}
+    set Busy 1
+    set code [catch {Execute} message]
+    set Busy 0
+    if {$code} {
+        set logFile [::OrCADQuickTools::TempPath OrCADPinNetExport.log]
+        set channel ""
+        set details ""
+        if {$logFile ne "" && ![catch {
+            set channel [open $logFile w]
+            fconfigure $channel -encoding utf-8
+            puts $channel $message
+            close $channel
+            set channel ""
+        }]} {set details "\n\nDiagnostic log:\n$logFile"}
+        if {$channel ne ""} {catch {close $channel}}
+        catch {tk_messageBox -type ok -icon error -title "Excel Export" -message "$message$details"}
+        puts "Pin-net export failed: $message"
     }
-    if {[catch {set lSelectedObjects [GetSelectedObjects]} lSelectionError]} {
-        puts "Pin-net export: cannot read the current selection: $lSelectionError"
-        return
-    }
+}
 
-    set lPage "NULL"
-    catch {set lPage [GetActivePage]}
-    set lPageName [::SelectedPinNetExport::GetPageName $lPage]
-    set lStatus [DboState]
-    set lRows {}
-    set lPartCount 0
-    set lPinCount 0
-    set lSkipped 0
-    set lFailed 0
-    array set lSeen {}
-
-    foreach lObject $lSelectedObjects {
-        if {![::OrCADQuickTools::IsPlacedPart $lObject]} {
-            incr lSkipped
-            continue
+proc ::SelectedPinNetExport::Execute {} {
+    set page [GetActivePage]
+    if {[::QuickToolsDbo::Null $page]} {error "Open a schematic page first."}
+    set selection [GetSelectedObjects]
+    set parts {}; set skipped 0
+    array set seen {}
+    foreach object $selection {
+        if {[info exists seen($object)]} {continue}
+        set seen($object) 1
+        if {[::OrCADQuickTools::IsPlacedPart $object]} {
+            lappend parts $object
+        } else {
+            incr skipped
         }
-        if {[info exists lSeen($lObject)]} {
-            continue
-        }
-        set lSeen($lObject) 1
-
-        set lReference [::SelectedPinNetExport::GetObjectString $lObject "GetReference"]
-        set lValue [::SelectedPinNetExport::GetObjectString $lObject "GetPartValue"]
-        if {$lReference == ""} {
-            incr lFailed
-            continue
-        }
-
-        set lPinsIter "NULL"
-        if {[catch {set lPinsIter [$lObject NewPinsIter $lStatus]}] ||
-            $lPinsIter == "NULL" || $lPinsIter == ""} {
-            incr lFailed
-            continue
-        }
-
-        incr lPartCount
-        set lPin [$lPinsIter NextPin $lStatus]
-        while {$lPin != "NULL"} {
-            set lPinNumber [::SelectedPinNetExport::GetObjectString $lPin "GetPinNumber"]
-            set lPinName [::SelectedPinNetExport::GetObjectString $lPin "GetPinName"]
-            set lNetName [::SelectedPinNetExport::GetNetName $lPin $lStatus]
-            if {$lNetName == ""} {
-                set lConnection "Unconnected"
-            } else {
-                set lConnection "Connected"
-            }
-            lappend lRows [list $lPageName $lReference $lValue $lPinNumber $lPinName $lNetName $lConnection]
-            incr lPinCount
-            set lPin [$lPinsIter NextPin $lStatus]
-        }
-        catch {delete_DboPartInstPinsIter $lPinsIter}
     }
+    if {![llength $parts]} {error "Select at least one schematic component."}
 
-    catch {$lStatus -delete}
-    if {$lPinCount == 0} {
-        catch {tk_messageBox -type ok -icon warning -title "Excel Export" \
-            -message "No pins were found on the selected schematic parts."}
-        puts "Pin-net export: no pins found; selected-parts=$lPartCount, skipped=$lSkipped, failed=$lFailed"
-        return
+    set output [ChooseOutputFile]
+    if {$output eq ""} {return}
+    if {[GetActivePage] ne $page || [GetSelectedObjects] ne $selection} {
+        error "The page or selection changed while choosing the output file. Run the export again."
     }
+    if {![string equal -nocase [file extension $output] .xlsx]} {append output .xlsx}
 
-    set lOutputFile [::SelectedPinNetExport::ChooseOutputFile]
-    if {$lOutputFile == ""} {
-        puts "Pin-net export: cancelled."
-        return
+    set pageName [::QuickToolsDbo::String $page GetName]
+    set rows {}; set noPins 0
+    foreach part $parts {
+        set reference [::PageReferenceFix::GetReference $part]
+        if {$reference eq ""} {error "$pageName: A selected part has no readable reference."}
+        set unitRows [::DesignPinNetExport::PartRows $page $pageName $part $reference]
+        if {![llength $unitRows]} {incr noPins}
+        foreach row $unitRows {lappend rows $row}
     }
-    if {![string equal -nocase [file extension $lOutputFile] ".xlsx"]} {
-        append lOutputFile ".xlsx"
-    }
-
-    set lLogFile [file join $::env(TEMP) "OrCADPinNetExport.log"]
-    set lExportResult [catch {
-        ::OrCADPinNetXlsx::WriteWorkbook $lOutputFile $lRows
-    } lExportMessage]
-
-    if {$lExportResult != 0 || ![file exists $lOutputFile]} {
-        catch {
-            set lLogChannel [open $lLogFile "w"]
-            fconfigure $lLogChannel -encoding utf-8 -translation lf
-            puts $lLogChannel "OrCAD pure-Tcl XLSX export failed"
-            puts $lLogChannel "Output: $lOutputFile"
-            puts $lLogChannel "Parts: $lPartCount"
-            puts $lLogChannel "Pins: $lPinCount"
-            puts $lLogChannel "Error: $lExportMessage"
-            close $lLogChannel
-        }
-        catch {tk_messageBox -type ok -icon error -title "Excel Export" \
-            -message "Excel workbook export failed.\n\n$lExportMessage\n\nDiagnostic log:\n$lLogFile"}
-        puts "Pin-net export: pure-Tcl writer failed: $lExportMessage; log=$lLogFile"
-        return
-    }
-    catch {file delete -force $lLogFile}
-
+    if {![llength $rows]} {error "No pins were found on the selected schematic parts."}
+    ::OrCADPinNetXlsx::WriteWorkbook $output $rows
     catch {tk_messageBox -type ok -icon info -title "Excel Export" \
-        -message "Export complete.\n\nParts: $lPartCount\nPins: $lPinCount\nFile: $lOutputFile"}
-    puts "Pin-net export: parts=$lPartCount, pins=$lPinCount, skipped=$lSkipped, failed=$lFailed, file=$lOutputFile"
+        -message "Export complete.\n\nPlaced units: [llength $parts]\nPins: [llength $rows]\nUnits with no pins: $noPins\nOther selected objects skipped: $skipped\nFile: $output"}
+    puts "Pin-net export: placed-units=[llength $parts], pins=[llength $rows], zero-pin-units=$noPins, skipped=$skipped, file=$output"
 }
 
 # -----------------------------------------------------------------------------
@@ -1981,10 +1996,22 @@ proc ::QuickToolsHelp::ShortcutText {} {
     variable AuthorName
     variable AuthorWeChat
     set lText ""
-    foreach lItem [::QuickToolsHelp::ShortcutItems] {
+    set lItems [::QuickToolsHelp::ShortcutItems]
+    foreach lItem $lItems {
         append lText "[lindex $lItem 0]    [lindex $lItem 1]\n"
     }
-    append lText "\n\u5982\u9700\u540C\u65F6\u91CD\u7F6E\u9875\u7801\u548C\u6240\u6709\u4F4D\u53F7\uFF0C\u8BF7\u6309\u987A\u5E8F\u6267\u884C\uFF1A\n1. Alt+F10\n2. Alt+F9"
+    set lNumberStep 0
+    foreach lCommand {::PageAutoAnnotate::RunPageNumbers ::PageAutoAnnotate::RunAll} {
+        foreach lItem $lItems {
+            if {[lindex $lItem 2] eq $lCommand} {
+                lappend lSteps "[incr lNumberStep]. [lindex $lItem 0]"
+                break
+            }
+        }
+    }
+    if {$lNumberStep == 2} {
+        append lText "\n\u5982\u9700\u540C\u65F6\u91CD\u7F6E\u9875\u7801\u548C\u6240\u6709\u4F4D\u53F7\uFF0C\u8BF7\u6309\u987A\u5E8F\u6267\u884C\uFF1A\n[join $lSteps \n]"
+    }
     append lText "\n\n\u9F20\u6807\u6EDA\u8F6E\uFF1A\u7ED8\u56FE\u533A\u76F4\u63A5\u7F29\u653E\uFF08\u65E0\u9700 Ctrl\uFF09\n\u6309\u4F4F\u53F3\u952E\u62D6\u52A8\uFF1A\u753B\u5E03\u8DDF\u968F\u9F20\u6807\u79FB\u52A8\uFF0C\u677E\u5F00\u505C\u6B62\nAccessories > \u5FEB\u6377\u5DE5\u5177 > \u9F20\u6807\u5BFC\u822A\u5F00\u5173"
     append lText "\n\n\u5355\u51FB\u5668\u4EF6\uFF1A\u65E5\u5FD7\u663E\u793A\u53C2\u6570\u3002\nAccessories > \u5FEB\u6377\u5DE5\u5177 > \u5355\u51FB\u5668\u4EF6\u53C2\u6570\u9884\u89C8\u5F00\u5173"
     append lText "\n\n\u4F5C\u8005\uFF1A$AuthorName\n\u8054\u7CFB\u65B9\u5F0F\uFF08VX\uFF09\uFF1A$AuthorWeChat"
